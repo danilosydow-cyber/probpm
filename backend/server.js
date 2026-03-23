@@ -3,7 +3,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 
-import { analyzeProcess } from "./services/processAnalyzer.js";
+import { analyzeText } from "./services/processAnalyzer.js"; // ✅ FIX
 import { generateBpmn } from "./services/bpmnGenerator.js";
 
 const app = express();
@@ -12,14 +12,12 @@ const PORT = 5000;
 /*
 MIDDLEWARE
 */
-
 app.use(cors());
 app.use(express.json());
 
 /*
 TEST ROUTE
 */
-
 app.get("/", (req, res) => {
     res.send("ProBPM API läuft 🚀");
 });
@@ -27,7 +25,6 @@ app.get("/", (req, res) => {
 /*
 ANALYZE ROUTE
 */
-
 app.post("/analyze", async (req, res) => {
     try {
         const { text } = req.body;
@@ -38,22 +35,18 @@ app.post("/analyze", async (req, res) => {
             });
         }
 
-        console.log("📥 TEXT EMPFANGEN:");
-        console.log(text);
+        console.log("📥 TEXT EMPFANGEN:\n", text);
 
         /*
-        1. PROCESS ANALYZER (KI)
+        1. KI ANALYSE
         */
+        const process = await analyzeText(text); // ✅ FIX
 
-        const process = await analyzeProcess(text);
-
-        console.log("🧠 ANALYSE ERGEBNIS:");
-        console.log(process);
+        console.log("🧠 ANALYSE ERGEBNIS:\n", process);
 
         /*
         2. BPMN GENERATOR
         */
-
         const xml = await generateBpmn(process);
 
         console.log("📊 BPMN ERZEUGT");
@@ -61,17 +54,15 @@ app.post("/analyze", async (req, res) => {
         /*
         RESPONSE
         */
-
-        res.json({
-            xml
-        });
+        res.json({ xml });
 
     } catch (error) {
-        console.error("❌ FEHLER:", error);
+        console.error("❌ SERVER ERROR:", error);
 
         res.status(500).json({
             error: "Server Fehler",
-            details: error.message
+            details: error.message,
+            hint: "Check AI response & JSON parsing"
         });
     }
 });
@@ -79,7 +70,6 @@ app.post("/analyze", async (req, res) => {
 /*
 SERVER START
 */
-
 app.listen(PORT, () => {
     console.log(`🚀 Server läuft auf http://localhost:${PORT}`);
 });

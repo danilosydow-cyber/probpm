@@ -1,24 +1,42 @@
-body {
+/* 🔥 Grundlayout */
+html, body, #root {
+    height: 100%;
     margin: 0;
-    font-family: Arial;
+    padding: 0;
 }
 
-.app-layout {
-    display: flex;
-    height: 100vh;
-}
-
-.left-panel {
-    width: 35%;
-    padding: 20px;
-    border-right: 1px solid #ddd;
-}
-
-.right-panel {
-    flex: 1;
-}
-
-#bpmn-container {
-    width: 100%;
+/* 🔥 BPMN Container korrekt skalieren */
+.djs-container {
     height: 100%;
 }
+
+/* 🔥 Palette breiter machen */
+.djs-palette {
+    width: 120px !important;
+    background: #f4f6f8;
+    border-right: 1px solid #ccc;
+}
+
+    /* 🔥 Einträge größer (aber Icons NICHT verändern!) */
+    .djs-palette .entry {
+        width: 100% !important;
+        height: 50px !important;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+        /* 🔥 Hover Effekt */
+        .djs-palette .entry:hover {
+            background: #e0e0e0;
+        }
+
+    /* 🔥 Optional: Scrollbar schöner */
+    .djs-palette::-webkit-scrollbar {
+        width: 6px;
+    }
+
+    .djs-palette::-webkit-scrollbar-thumb {
+        background: #bbb;
+        border-radius: 3px;
+    }

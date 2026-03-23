@@ -1,51 +1,94 @@
-import dotenv from "dotenv";
-dotenv.config();
 import OpenAI from "openai";
 
-// 🔑 OpenAI Client (funktioniert mit sk-proj- Keys)
 const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
 
-export async function analyzeProcess(text) {
-    // ❌ Fehler wenn kein Text
-    if (!text || text.trim() === "") {
-        throw new Error("Kein Text übergeben");
-    }
+// 🔧 JSON Extraction Helper
+function extractJSON(text) {
+    if (!text) return null;
 
     try {
-        console.log("📥 Eingehender Text:", text);
+        // Entferne Markdown-Blöcke
+        const cleaned = text
+            .replace(/```json/g, "")
+            .replace(/```/g, "")
+            .trim();
 
-        // 🔥 OpenAI Request (NEUE API!)
-        const response = await client.responses.create({
-            model: "gpt-4.1-mini",
-            input: `
-Du bist ein BPMN-Experte.
+        // 🔥 Versuch direkt zu parsen
+        return JSON.parse(cleaned);
 
-Analysiere den folgenden Prozess und gib eine strukturierte Liste von Schritten zurück.
+    } catch (err) {
+        console.warn("⚠️ Direct parse failed, trying fallback...");
 
-Format:
-1. Schritt 1
-2. Schritt 2
-3. Schritt 3
+        // 🔥 Fallback: JSON im Text suchen
+        const match = text.match(/\{[\s\S]*\}/);
 
-Prozess:
-${text}
-      `
-        });
+        if (match) {
+            try {
+                return JSON.parse(match[0]);
+            } catch (e) {
+                console.error("❌ Fallback JSON parse failed");
+            }
+        }
 
-        // ✅ Antwort sauber extrahieren
-        const result = response.output[0].content[0].text;
+        console.error("❌ Could not extract valid JSON");
+        console.log("🔍 RAW OUTPUT:\n", text);
 
-        console.log("🤖 AI Antwort:", result);
-
-        return result;
-
-    } catch (error) {
-        console.error("❌ OpenAI Fehler:", error);
-
-        throw new Error(
-            error?.message || "Fehler bei der Prozessanalyse"
-        );
+        return null;
     }
+}
+
+export async function analyzeText(text) {
+
+    const prompt = `
+Extract a BPMN process.
+
+STRICT RULES:
+- Output ONLY valid JSON
+- No markdown
+- No explanation
+- No text before or after JSON
+
+Schema:
+{
+  "steps":[
+    {"id":"start","type":"startEvent","name":"Start"},
+    {"id":"task1","type":"task","name":"Example"},
+    {"id":"end","type":"endEvent","name":"End"}
+  ],
+  "flows":[
+    {"from":"start","to":"task1"},
+    {"from":"task1","to":"end"}
+  ]
+}
+
+Text:
+${text}
+`;
+
+    const response = await client.chat.completions.create({
+        model: "gpt-4.1-mini",
+        temperature: 0.2, // 🔥 stabilere Outputs
+        messages: [
+            { role: "user", content: prompt }
+        ]
+    });
+
+    const raw = response.choices[0]?.message?.content;
+
+    console.log("🧠 RAW AI RESPONSE:\n", raw);
+
+    const parsed = extractJSON(raw);
+
+    // 🛡️ HARTE VALIDIERUNG
+    if (
+        !parsed ||
+        !Array.isArray(parsed.steps) ||
+        !Array.isArray(parsed.flows)
+    ) {
+        throw new Error("Invalid AI response structure");
+    }
+
+    return parsed;
 }

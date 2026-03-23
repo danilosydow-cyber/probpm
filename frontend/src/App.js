@@ -1,24 +1,27 @@
 import React, { useState } from "react";
+import "./App.css";
+
 import Upload from "./components/Upload";
-import BpmnEditor from "./BpmnEditor";
+import BpmnEditor from "./components/BpmnEditor";
 
 function App() {
+    const [xml, setXml] = useState("");
 
-  const [bpmnXML, setBpmnXML] = useState(null);
+    return (
+        <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
 
-  return (
-    <div style={{ display: "flex", height: "100vh" }}>
+            {/* LEFT */}
+            <div style={{ width: "300px", borderRight: "1px solid #ccc" }}>
+                <Upload setBpmnXml={setXml} />
+            </div>
 
-      <div style={{ width: "300px", padding: "20px" }}>
-        <Upload setBpmnXML={setBpmnXML} />
-      </div>
+            {/* RIGHT */}
+            <div style={{ flex: 1, height: "100%", position: "relative" }}>
+                <BpmnEditor bpmnXML={xml} />
+            </div>
 
-      <div style={{ flex: 1 }}>
-        <BpmnEditor bpmnXML={bpmnXML} />
-      </div>
-
-    </div>
-  );
+        </div>
+    );
 }
 
 export default App;

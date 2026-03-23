@@ -1,124 +1,76 @@
-import { layoutProcess } from "bpmn-auto-layout";
-
 export async function generateBpmn(process) {
 
-  /*
-  LANE NODE MAPPING
-  */
+    if (!process || !process.steps || !process.flows) {
+        throw new Error("Invalid process");
+    }
 
-  const laneNodeMap = {};
-
-  if (process.lanes) {
-    process.lanes.forEach(lane => {
-      laneNodeMap[lane.name] = [];
-    });
-  }
-
-  if (process.tasks) {
-    process.tasks.forEach(task => {
-      if (task.lane && laneNodeMap[task.lane]) {
-        laneNodeMap[task.lane].push(task.id);
-      }
-    });
-  }
-
-  /*
-  LANES XML
-  */
-
-  let lanesXML = "";
-
-  if (process.lanes) {
-
-    process.lanes.forEach(lane => {
-
-      let nodeRefs = "";
-
-      if (laneNodeMap[lane.name]) {
-        laneNodeMap[lane.name].forEach(nodeId => {
-          nodeRefs += `<bpmn:flowNodeRef>${nodeId}</bpmn:flowNodeRef>`;
-        });
-      }
-
-      lanesXML += `
-<bpmn:lane id="${lane.id}" name="${lane.name}">
-${nodeRefs}
-</bpmn:lane>`;
-
+    const nameToId = {};
+    process.steps.forEach(step => {
+        nameToId[step.name?.toLowerCase()] = step.id;
     });
 
-  }
+    let x = 150;
+    let y = 100;
 
-  /*
-  TASKS
-  */
+    const positions = {};
 
-  let tasksXML = "";
+    let elementsXML = "";
+    let flowsXML = "";
+    let shapesXML = "";
+    let edgesXML = "";
 
-  process.tasks.forEach(task => {
+    /*
+    STEPS
+    */
+    process.steps.forEach((step) => {
 
-    tasksXML += `
-<bpmn:task id="${task.id}" name="${task.name}" />`;
+        positions[step.id] = { x, y };
 
-  });
+        elementsXML += `
+<bpmn:${step.type} id="${step.id}" name="${step.name || ""}" />`;
 
-  /*
-  GATEWAYS
-  */
+        shapesXML += `
+<bpmndi:BPMNShape id="${step.id}_di" bpmnElement="${step.id}">
+  <dc:Bounds x="${x}" y="${y}" width="100" height="80"/>
+</bpmndi:BPMNShape>`;
 
-  let gatewaysXML = "";
-
-  if (process.gateways) {
-
-    process.gateways.forEach(gateway => {
-
-      if (gateway.type === "exclusive") {
-
-        gatewaysXML += `
-<bpmn:exclusiveGateway id="${gateway.id}" />`;
-
-      }
-
+        x += 200;
     });
 
-  }
+    /*
+    FLOWS
+    */
+    process.flows.forEach((flow, index) => {
 
-  /*
-  FLOWS
-  */
+        let source = flow.source || flow.from;
+        let target = flow.target || flow.to;
 
-  let flowsXML = "";
+        if (!positions[source]) {
+            source = nameToId[source?.toLowerCase()];
+        }
 
-  process.flows.forEach((flow, index) => {
+        if (!positions[target]) {
+            target = nameToId[target?.toLowerCase()];
+        }
 
-    flowsXML += `
-<bpmn:sequenceFlow
- id="Flow_${index}"
- sourceRef="${flow.source}"
- targetRef="${flow.target}" />`;
+        if (!positions[source] || !positions[target]) return;
 
-  });
+        const id = `Flow_${index}`;
 
-  /*
-  LANE SET
-  */
+        flowsXML += `
+<bpmn:sequenceFlow id="${id}" sourceRef="${source}" targetRef="${target}" />`;
 
-  let laneSetXML = "";
+        const start = positions[source];
+        const end = positions[target];
 
-  if (lanesXML !== "") {
+        edgesXML += `
+<bpmndi:BPMNEdge id="${id}_di" bpmnElement="${id}">
+  <di:waypoint x="${start.x + 100}" y="${start.y + 40}" />
+  <di:waypoint x="${end.x}" y="${end.y + 40}" />
+</bpmndi:BPMNEdge>`;
+    });
 
-    laneSetXML = `
-<bpmn:laneSet id="LaneSet_1">
-${lanesXML}
-</bpmn:laneSet>`;
-
-  }
-
-  /*
-  BPMN BASIS
-  */
-
-  const baseBpmn = `<?xml version="1.0" encoding="UTF-8"?>
+    return `<?xml version="1.0" encoding="UTF-8"?>
 
 <bpmn:definitions
  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -129,29 +81,18 @@ ${lanesXML}
  targetNamespace="http://bpmn.io/schema/bpmn">
 
 <bpmn:process id="Process_1" isExecutable="false">
-
-${laneSetXML}
-
-<bpmn:startEvent id="StartEvent_1" />
-
-${tasksXML}
-
-${gatewaysXML}
-
-<bpmn:endEvent id="EndEvent_1" />
-
+${elementsXML}
 ${flowsXML}
-
 </bpmn:process>
 
+<bpmndi:BPMNDiagram id="BPMNDiagram_1">
+<bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_1">
+
+${shapesXML}
+${edgesXML}
+
+</bpmndi:BPMNPlane>
+</bpmndi:BPMNDiagram>
+
 </bpmn:definitions>`;
-
-  /*
-  AUTO LAYOUT
-  */
-
-  const xmlWithLayout = await layoutProcess(baseBpmn);
-
-  return xmlWithLayout;
-
 }
