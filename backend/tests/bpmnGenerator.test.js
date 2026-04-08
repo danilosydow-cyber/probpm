@@ -65,6 +65,6 @@ test("generateBPMN escapes XML special characters", () => {
     };
 
     const xml = generateBPMN(process);
-    assert.ok(xml.includes("Check &lt;input&gt; &amp; confirm"));
+    assert.ok(xml.includes("Check &lt;input&gt; &amp;"));
     assert.ok(xml.includes("R&amp;D"));
 });

@@ -4,6 +4,50 @@ const client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
 
+function compactLabel(value, maxWords = 3) {
+    const text = String(value || "").trim().replace(/\s+/g, " ");
+    if (!text) return "";
+    const words = text.split(" ");
+    return words.length <= maxWords ? text : words.slice(0, maxWords).join(" ");
+}
+
+function normalizeRoleName(value) {
+    return compactLabel(value, 3);
+}
+
+function buildConsistentRoles(json) {
+    const knownRoles = [];
+    const roleIndex = new Map();
+
+    const addRole = (roleName) => {
+        const normalized = normalizeRoleName(roleName);
+        if (!normalized) return null;
+        const key = normalized.toLowerCase();
+        if (!roleIndex.has(key)) {
+            roleIndex.set(key, normalized);
+            knownRoles.push(normalized);
+        }
+        return roleIndex.get(key);
+    };
+
+    (json.roles || []).forEach(addRole);
+    (json.steps || []).forEach((step) => addRole(step?.role));
+
+    if (knownRoles.length === 0) {
+        knownRoles.push("System");
+        roleIndex.set("system", "System");
+    }
+
+    json.roles = knownRoles;
+    json.steps = (json.steps || []).map((step) => {
+        const resolvedRole = addRole(step?.role) || knownRoles[0];
+        return {
+            ...step,
+            role: resolvedRole
+        };
+    });
+}
+
 export async function analyzeTextToProcess(text) {
 
     if (!text || text.length < 5) {
@@ -55,9 +99,14 @@ WICHTIG:
   - Entscheidungen
 
 - Jeder Step hat genau eine Rolle
+- Rollen explizit und durchgängig benennen (z. B. Mitarbeiter, Teamleiter, System)
+- Falls mehrere Akteure beteiligt sind, alle Rollen getrennt ausweisen
+- Step.role muss exakt einer Rolle aus "roles" entsprechen
 - IDs streng fortlaufend (step_1, step_2, ...)
 - KEINE losen Verbindungen
 - Jeder Step muss erreichbar sein
+- Benenne Elemente effizient: Labels für Rollen und Steps maximal 3 Wörter
+- Nur im Notfall darf ein Label länger sein, sonst kurz und prägnant
 
 - "conditions" NUR bei gateways
 - "next" NUR bei tasks
@@ -151,6 +200,14 @@ ${text}
                 step.type = "task";
             }
         });
+
+        // Benennung hart begrenzen, damit Modellierungselemente kurz bleiben
+        json.roles = (json.roles || []).map((role) => compactLabel(role, 3) || "Rolle");
+        json.steps = (json.steps || []).map((step, index) => ({
+            ...step,
+            label: compactLabel(step?.label, 3) || `Schritt ${index + 1}`
+        }));
+        buildConsistentRoles(json);
 
         console.log("✅ Analyzer Output:", json);
 

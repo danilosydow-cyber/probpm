@@ -4,6 +4,7 @@ import "./App.css";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn.css";
 import { customPaletteModule } from "./bpmn/customPaletteProvider";
+import { customTranslateModule } from "./bpmn/customTranslateModule";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
@@ -74,6 +75,7 @@ function App() {
     const containerRef = useRef(null);
     const paletteHostRef = useRef(null);
     const modelerRef = useRef(null);
+    const activePaletteEntryRef = useRef(null);
 
     const attachPalette = () => {
         if (!containerRef.current || !paletteHostRef.current) return;
@@ -81,6 +83,32 @@ function App() {
         if (paletteEl && !paletteHostRef.current.contains(paletteEl)) {
             paletteHostRef.current.appendChild(paletteEl);
         }
+    };
+
+    const clearActivePaletteEntry = () => {
+        if (!activePaletteEntryRef.current) return;
+        activePaletteEntryRef.current.classList.remove("palette-entry-active");
+        activePaletteEntryRef.current = null;
+    };
+
+    const setupPaletteInteraction = () => {
+        if (!paletteHostRef.current) return;
+        const paletteEntries = paletteHostRef.current.querySelector(".djs-palette-entries");
+        if (!paletteEntries || paletteEntries.dataset.interactionBound === "true") return;
+
+        paletteEntries.dataset.interactionBound = "true";
+        paletteEntries.addEventListener("click", (event) => {
+            const entry = event.target.closest(".entry");
+            if (!entry) return;
+
+            clearActivePaletteEntry();
+            entry.classList.add("palette-entry-active", "palette-entry-click");
+            activePaletteEntryRef.current = entry;
+
+            window.setTimeout(() => {
+                entry.classList.remove("palette-entry-click");
+            }, 220);
+        });
     };
 
     const applyElementColor = (element) => {
@@ -111,7 +139,7 @@ function App() {
 
         modelerRef.current = new BpmnModeler({
             container: containerRef.current,
-            additionalModules: [customPaletteModule]
+            additionalModules: [customPaletteModule, customTranslateModule]
         });
 
         const scheduleApplyColor = (element) => {
@@ -122,6 +150,7 @@ function App() {
         const eventBus = modelerRef.current.get("eventBus");
         eventBus.on("shape.added", ({ element }) => {
             scheduleApplyColor(element);
+            clearActivePaletteEntry();
         });
         eventBus.on("commandStack.shape.create.postExecuted", ({ context }) => {
             scheduleApplyColor(context?.shape);
@@ -139,6 +168,7 @@ function App() {
         modelerRef.current.createDiagram()
             .then(() => {
                 attachPalette();
+                setupPaletteInteraction();
                 applyElementColors();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })
@@ -153,6 +183,7 @@ function App() {
         modelerRef.current.importXML(xml)
             .then(() => {
                 attachPalette();
+                setupPaletteInteraction();
                 applyElementColors();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })

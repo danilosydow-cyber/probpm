@@ -7,6 +7,13 @@ function escapeXml(value) {
         .replaceAll("'", "&apos;");
 }
 
+function compactLabel(value, maxWords = 3) {
+    const text = String(value || "").trim().replace(/\s+/g, " ");
+    if (!text) return "";
+    const words = text.split(" ");
+    return words.length <= maxWords ? text : words.slice(0, maxWords).join(" ");
+}
+
 function normalizeType(step) {
     if (step.type === "end" || step.type === "endEvent") return "endEvent";
     if (step.type === "gateway") return "gateway";
@@ -108,7 +115,8 @@ export function generateBPMN(process) {
     const roleMap = {};
     roles.forEach((role, i) => {
         const id = typeof role === "string" ? `role_${i}` : role.id || `role_${i}`;
-        const name = typeof role === "string" ? role : role.name || `Role ${i + 1}`;
+        const rawName = typeof role === "string" ? role : role.name || `Role ${i + 1}`;
+        const name = compactLabel(rawName, 3) || `Role ${i + 1}`;
         roleMap[id] = { id, name, steps: [] };
     });
 
@@ -191,7 +199,7 @@ id="Defs_1">
     xml += `</bpmn:laneSet>`;
 
     steps.forEach((step) => {
-        const name = escapeXml(step.label || "undefined");
+        const name = escapeXml(compactLabel(step.label || "undefined", 3));
         if (step.type === "startEvent") {
             xml += `<bpmn:startEvent id="${step.id}" name="${name}" />`;
         } else if (step.type === "endEvent") {

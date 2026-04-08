@@ -137,13 +137,56 @@
   height: 48px;
   line-height: 48px;
   font-size: 32px;
+  border-radius: 6px;
+  border: 1px solid #d8dbe3;
+  transition: transform 120ms ease, box-shadow 160ms ease, filter 160ms ease;
+  transform-origin: center;
+  cursor: pointer;
 }
 
 .palette-host .djs-palette .entry::before {
   line-height: 48px;
 }
 
+.palette-host .djs-palette .entry:hover {
+  box-shadow: 0 2px 8px rgba(18, 28, 45, 0.18);
+}
+
+.palette-host .djs-palette .entry.palette-entry-click,
+.palette-host .djs-palette .entry:active {
+  transform: scale(0.94);
+  filter: saturate(1.1);
+}
+
+.palette-host .djs-palette .entry.palette-entry-active {
+  box-shadow: 0 0 0 2px #1f3f95, 0 4px 10px rgba(31, 63, 149, 0.28);
+}
+
+.palette-host .djs-palette .entry.palette-role {
+  background: #e8f5e9;
+  border-color: #2e7d32;
+}
+
+.palette-host .djs-palette .entry.palette-activity {
+  background: #e3f2fd;
+  border-color: #1565c0;
+}
+
+.palette-host .djs-palette .entry.palette-gateway {
+  background: #fff9c4;
+  border-color: #f9a825;
+}
+
+.palette-host .djs-palette .entry.palette-resource {
+  background: #f3e5f5;
+  border-color: #7b1fa2;
+}
+
 .palette-host .djs-palette .entry.bpmn-icon-gateway-none {
+  display: none;
+}
+
+.palette-host .djs-palette .entry.bpmn-icon-data-store:not(.palette-resource) {
   display: none;
 }
 

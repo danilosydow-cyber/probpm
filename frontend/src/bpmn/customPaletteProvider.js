@@ -8,7 +8,18 @@ class CustomPaletteProvider {
     }
 
     getPaletteEntries() {
+        const paletteClassByGroup = {
+            activity: "palette-activity",
+            gateway: "palette-gateway",
+            collaboration: "palette-role",
+            resource: "palette-resource"
+        };
+
         const createAction = (type, className, title, options = {}) => {
+            const paletteClassName = paletteClassByGroup[options.group]
+                ? `${className} ${paletteClassByGroup[options.group]}`
+                : className;
+
             const createListener = (event) => {
                 const businessObject = options.businessObjectFactory
                     ? options.businessObjectFactory()
@@ -27,7 +38,7 @@ class CustomPaletteProvider {
 
             return {
                 group: options.group || "model",
-                className,
+                className: paletteClassName,
                 title,
                 action: {
                     dragstart: createListener,
@@ -112,10 +123,10 @@ class CustomPaletteProvider {
                         createEventWithDefinition("bpmn:IntermediateCatchEvent", "bpmn:SignalEventDefinition")
                 }
             ),
-            "create.activity-task": createAction(
+            "create.task": createAction(
                 "bpmn:Task",
                 "bpmn-icon-task",
-                "Task",
+                "Aktivität",
                 {
                     group: "activity"
                 }
@@ -132,7 +143,7 @@ class CustomPaletteProvider {
             "create.service-task": createAction(
                 "bpmn:ServiceTask",
                 "bpmn-icon-service-task",
-                "IT-System (Service Task)",
+                "Automatische Aktivität",
                 { group: "activity" }
             ),
             "create.gateway-exclusive": createAction(
@@ -152,6 +163,12 @@ class CustomPaletteProvider {
                 "bpmn-icon-gateway-eventbased",
                 "Gateway: Ereignisbasiert",
                 { group: "gateway" }
+            ),
+            "create.data-store-reference": createAction(
+                "bpmn:DataStoreReference",
+                "bpmn-icon-data-store",
+                "Datenbank",
+                { group: "resource" }
             ),
             "create.participant-collapsed": createAction(
                 "bpmn:Participant",
