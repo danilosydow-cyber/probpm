@@ -7,6 +7,8 @@ function App() {
     const [text, setText] = useState("");
     const [xml, setXml] = useState("");
     const [json, setJson] = useState(null);
+    const [error, setError] = useState("");
+    const [isLoading, setIsLoading] = useState(false);
 
     const containerRef = useRef(null);
     const viewerRef = useRef(null);
@@ -43,6 +45,8 @@ function App() {
     }, []);
 
     const handleAnalyze = async () => {
+        setError("");
+        setIsLoading(true);
         try {
             const res = await fetch(`${API_BASE_URL}/api/generate`, {
                 method: "POST",
@@ -58,12 +62,14 @@ function App() {
                 setJson(data.json);
                 setXml(data.xml);
             } else {
-                alert("Fehler: " + (data.error || JSON.stringify(data)));
+                setError(data.error || "Unbekannter Fehler bei der Analyse.");
             }
 
         } catch (err) {
             console.error(err);
-            alert("Backend nicht erreichbar");
+            setError(`Backend nicht erreichbar unter ${API_BASE_URL}.`);
+        } finally {
+            setIsLoading(false);
         }
     };
 
@@ -81,9 +87,22 @@ function App() {
 
             <br /><br />
 
-            <button onClick={handleAnalyze}>
-                Prozess analysieren
+            <button onClick={handleAnalyze} disabled={isLoading}>
+                {isLoading ? "Analysiere..." : "Prozess analysieren"}
             </button>
+            {error ? (
+                <div
+                    style={{
+                        marginTop: "12px",
+                        padding: "10px",
+                        border: "1px solid #ffb3b3",
+                        background: "#fff5f5",
+                        color: "#a40000"
+                    }}
+                >
+                    {error}
+                </div>
+            ) : null}
 
             <h2>JSON</h2>
             <pre style={{ background: "#eee", padding: 10 }}>
