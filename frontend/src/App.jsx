@@ -7,6 +7,62 @@ import { customPaletteModule } from "./bpmn/customPaletteProvider";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
+const COLOR_BY_CATEGORY = {
+    roles: { fill: "#E8F5E9", stroke: "#2E7D32" },
+    activities: { fill: "#E3F2FD", stroke: "#1565C0" },
+    gateways: { fill: "#FFF9C4", stroke: "#F9A825" },
+    resources: { fill: "#F3E5F5", stroke: "#7B1FA2" }
+};
+
+const ACTIVITY_TYPES = new Set([
+    "bpmn:Task",
+    "bpmn:UserTask",
+    "bpmn:ManualTask",
+    "bpmn:ScriptTask",
+    "bpmn:BusinessRuleTask",
+    "bpmn:SendTask",
+    "bpmn:ReceiveTask",
+    "bpmn:SubProcess",
+    "bpmn:CallActivity"
+]);
+
+const ROLE_TYPES = new Set(["bpmn:Participant", "bpmn:Lane"]);
+const RESOURCE_TYPES = new Set(["bpmn:DataObjectReference", "bpmn:DataStoreReference", "bpmn:DataStore"]);
+
+const isBpmnType = (element, bpmnType) => element?.businessObject?.$instanceOf?.(bpmnType);
+
+const getColorByElement = (element) => {
+    const type = element?.type;
+    if (!type) return null;
+
+    if (ROLE_TYPES.has(type) || isBpmnType(element, "bpmn:Participant") || isBpmnType(element, "bpmn:Lane")) {
+        return COLOR_BY_CATEGORY.roles;
+    }
+
+    if (type.includes("Gateway") || isBpmnType(element, "bpmn:Gateway")) {
+        return COLOR_BY_CATEGORY.gateways;
+    }
+
+    if (
+        RESOURCE_TYPES.has(type)
+        || isBpmnType(element, "bpmn:DataObjectReference")
+        || isBpmnType(element, "bpmn:DataStoreReference")
+        || isBpmnType(element, "bpmn:DataStore")
+    ) {
+        return COLOR_BY_CATEGORY.resources;
+    }
+
+    if (
+        ACTIVITY_TYPES.has(type)
+        || type.endsWith("Task")
+        || isBpmnType(element, "bpmn:Activity")
+    ) {
+        return COLOR_BY_CATEGORY.activities;
+    }
+
+    return null;
+};
+
 function App() {
     const [text, setText] = useState("");
     const [xml, setXml] = useState("");
@@ -27,6 +83,28 @@ function App() {
         }
     };
 
+    const applyElementColor = (element) => {
+        if (!modelerRef.current || !element) return;
+        const modeling = modelerRef.current.get("modeling");
+        const color = getColorByElement(element);
+        const di = element?.di;
+        const currentFill = di?.fill ?? di?.get?.("fill");
+        const currentStroke = di?.stroke ?? di?.get?.("stroke");
+        const needsUpdate = color && (currentFill !== color.fill || currentStroke !== color.stroke);
+        if (needsUpdate) {
+            modeling.setColor([element], color);
+        }
+    };
+
+    const applyElementColors = () => {
+        if (!modelerRef.current) return;
+        const elementRegistry = modelerRef.current.get("elementRegistry");
+
+        elementRegistry.forEach((element) => {
+            applyElementColor(element);
+        });
+    };
+
     // Initialize editor and palette on load
     useEffect(() => {
         if (!containerRef.current || modelerRef.current) return;
@@ -36,9 +114,32 @@ function App() {
             additionalModules: [customPaletteModule]
         });
 
+        const scheduleApplyColor = (element) => {
+            if (!element) return;
+            setTimeout(() => applyElementColor(element), 0);
+        };
+
+        const eventBus = modelerRef.current.get("eventBus");
+        eventBus.on("shape.added", ({ element }) => {
+            scheduleApplyColor(element);
+        });
+        eventBus.on("commandStack.shape.create.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.shape);
+        });
+        eventBus.on("commandStack.shape.append.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.shape);
+        });
+        eventBus.on("commandStack.elements.create.postExecuted", ({ context }) => {
+            (context?.elements || []).forEach(scheduleApplyColor);
+        });
+        eventBus.on("commandStack.shape.replace.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.newShape);
+        });
+
         modelerRef.current.createDiagram()
             .then(() => {
                 attachPalette();
+                applyElementColors();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })
             .catch((err) => {
@@ -52,6 +153,7 @@ function App() {
         modelerRef.current.importXML(xml)
             .then(() => {
                 attachPalette();
+                applyElementColors();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })
             .catch(err => {
