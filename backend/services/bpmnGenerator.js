@@ -14,6 +14,46 @@ function normalizeType(step) {
     return "task";
 }
 
+function dedupeFlows(flows) {
+    const seen = new Set();
+    return flows.filter((flow) => {
+        const key = `${flow.from}->${flow.to}:${flow.condition || ""}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+function computeStepRank(steps, flows, startId) {
+    const rank = {};
+    steps.forEach((step) => {
+        rank[step.id] = Number.MAX_SAFE_INTEGER;
+    });
+
+    rank[startId] = 0;
+    const queue = [startId];
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        const outgoing = flows.filter((flow) => flow.from === current);
+        outgoing.forEach((flow) => {
+            const nextRank = (rank[current] ?? 0) + 1;
+            if (nextRank < (rank[flow.to] ?? Number.MAX_SAFE_INTEGER)) {
+                rank[flow.to] = nextRank;
+                queue.push(flow.to);
+            }
+        });
+    }
+
+    steps.forEach((step) => {
+        if (rank[step.id] === Number.MAX_SAFE_INTEGER) {
+            rank[step.id] = 1;
+        }
+    });
+
+    return rank;
+}
+
 export function generateBPMN(process) {
     const roles = Array.isArray(process?.roles) && process.roles.length > 0 ? process.roles : ["System"];
     const steps = JSON.parse(JSON.stringify(process?.steps || []));
@@ -63,6 +103,7 @@ export function generateBPMN(process) {
     startCandidates.forEach((step) => {
         flows.unshift({ from: startId, to: step.id });
     });
+    const normalizedFlows = dedupeFlows(flows);
 
     const roleMap = {};
     roles.forEach((role, i) => {
@@ -76,7 +117,7 @@ export function generateBPMN(process) {
     steps.forEach((step) => {
         let roleId;
         if (step.type === "startEvent") {
-            const firstTarget = flows.find((flow) => flow.from === startId)?.to;
+            const firstTarget = normalizedFlows.find((flow) => flow.from === startId)?.to;
             const targetStep = steps.find((candidate) => candidate.id === firstTarget);
             roleId = Object.values(roleMap).find((role) => role.name === targetStep?.role)?.id;
         } else {
@@ -98,10 +139,8 @@ export function generateBPMN(process) {
         currentY += height + 40;
     });
 
-    const stepIndex = {};
-    steps.forEach((step, index) => {
-        stepIndex[step.id] = index;
-    });
+    const rank = computeStepRank(steps, normalizedFlows, startId);
+    const rankOffsets = {};
 
     const laneOffset = {};
     Object.keys(roleMap).forEach((id) => {
@@ -111,11 +150,17 @@ export function generateBPMN(process) {
     steps.forEach((step) => {
         const lane = laneMeta[step._roleId];
         const offset = laneOffset[step._roleId] * 70;
-        positions[step.id] = { x: 180 + stepIndex[step.id] * 220, y: lane.y + 30 + offset };
+        const currentRank = rank[step.id] || 1;
+        if (rankOffsets[currentRank] === undefined) {
+            rankOffsets[currentRank] = 0;
+        }
+        const x = 180 + currentRank * 220 + rankOffsets[currentRank] * 24;
+        positions[step.id] = { x, y: lane.y + 30 + offset };
+        rankOffsets[currentRank] += 1;
         laneOffset[step._roleId] += 1;
     });
 
-    const firstFlow = flows.find((flow) => flow.from === startId);
+    const firstFlow = normalizedFlows.find((flow) => flow.from === startId);
     if (firstFlow && positions[firstFlow.to]) {
         positions[startId] = {
             x: positions[firstFlow.to].x - 140,
@@ -123,7 +168,8 @@ export function generateBPMN(process) {
         };
     }
 
-    const diagramWidth = Math.max(1500, steps.length * 220 + 300);
+    const maxRank = Math.max(...Object.values(rank));
+    const diagramWidth = Math.max(1500, (maxRank + 2) * 240 + 300);
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions
 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -157,7 +203,7 @@ id="Defs_1">
         }
     });
 
-    flows.forEach((flow, i) => {
+    normalizedFlows.forEach((flow, i) => {
         const name = flow.condition ? ` name="${escapeXml(flow.condition)}"` : "";
         xml += `<bpmn:sequenceFlow id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}"${name} />`;
     });
@@ -178,7 +224,7 @@ id="Defs_1">
         xml += `<bpmndi:BPMNShape bpmnElement="${step.id}"><dc:Bounds x="${pos.x}" y="${pos.y}" width="${width}" height="${height}" /></bpmndi:BPMNShape>`;
     });
 
-    flows.forEach((flow, i) => {
+    normalizedFlows.forEach((flow, i) => {
         const from = positions[flow.from];
         const to = positions[flow.to];
         if (!from || !to) return;
@@ -195,10 +241,14 @@ id="Defs_1">
         const startY = from.y + fromHeight / 2;
         const endX = to.x;
         const endY = to.y + toHeight / 2;
-        const midX1 = startX + 40;
-        const midX2 = endX - 40;
+        if (endX <= startX) {
+            const loopX = Math.max(80, Math.min(from.x, to.x) - 80);
+            xml += `<bpmndi:BPMNEdge bpmnElement="flow_${i}"><di:waypoint x="${startX}" y="${startY}" /><di:waypoint x="${loopX}" y="${startY}" /><di:waypoint x="${loopX}" y="${endY}" /><di:waypoint x="${endX}" y="${endY}" /></bpmndi:BPMNEdge>`;
+            return;
+        }
 
-        xml += `<bpmndi:BPMNEdge bpmnElement="flow_${i}"><di:waypoint x="${startX}" y="${startY}" /><di:waypoint x="${midX1}" y="${startY}" /><di:waypoint x="${midX1}" y="${endY}" /><di:waypoint x="${midX2}" y="${endY}" /><di:waypoint x="${endX}" y="${endY}" /></bpmndi:BPMNEdge>`;
+        const midX = Math.round((startX + endX) / 2);
+        xml += `<bpmndi:BPMNEdge bpmnElement="flow_${i}"><di:waypoint x="${startX}" y="${startY}" /><di:waypoint x="${midX}" y="${startY}" /><di:waypoint x="${midX}" y="${endY}" /><di:waypoint x="${endX}" y="${endY}" /></bpmndi:BPMNEdge>`;
     });
 
     xml += `</bpmndi:BPMNPlane></bpmndi:BPMNDiagram></bpmn:definitions>`;
