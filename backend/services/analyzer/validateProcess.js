@@ -1,4 +1,5 @@
 import { AppError } from "../../utils/apiErrors.js";
+import { ALLOWED_TASK_KINDS } from "../bpmnSemantics.js";
 
 export function validateProcessShape(processJson) {
     if (!processJson || typeof processJson !== "object") {
@@ -32,5 +33,40 @@ export function validateProcessShape(processJson) {
     const hasEnd = processJson.steps.some((step) => step?.type === "end" || step?.type === "endEvent");
     if (!hasEnd) {
         throw new AppError("MISSING_END_EVENT", "Mindestens 1 End Event erforderlich", 422);
+    }
+
+    for (const step of processJson.steps) {
+        if (step?.taskKind != null) {
+            const k = String(step.taskKind).trim();
+            if (!ALLOWED_TASK_KINDS.has(k)) {
+                throw new AppError("INVALID_TASK_KIND", `Unbekannter taskKind: ${k}`, 422);
+            }
+        }
+
+        if (Array.isArray(step?.boundaryTimers)) {
+            for (const bt of step.boundaryTimers) {
+                const target = bt?.target;
+                if (typeof target !== "string" || !ids.has(target)) {
+                    throw new AppError(
+                        "INVALID_BOUNDARY_TIMER",
+                        "boundaryTimers.target muss eine gueltige Step-ID sein",
+                        422
+                    );
+                }
+            }
+        }
+    }
+
+    if (Array.isArray(processJson.annotations)) {
+        for (const ann of processJson.annotations) {
+            const attach = ann?.attachTo;
+            if (typeof attach !== "string" || !ids.has(attach)) {
+                throw new AppError(
+                    "INVALID_ANNOTATION",
+                    "annotations.attachTo muss eine gueltige Step-ID sein",
+                    422
+                );
+            }
+        }
     }
 }

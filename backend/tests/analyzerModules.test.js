@@ -146,3 +146,48 @@ test("normalizeProcessJson merges duplicate tasks with same role and label", () 
     const fix = normalized.steps.find((s) => s.id === "step_fix");
     assert.deepEqual(fix.next, ["step_a"], "Correction should loop back to canonical check task");
 });
+
+test("validateProcessShape rejects invalid taskKind", () => {
+    assert.throws(
+        () =>
+            validateProcessShape({
+                roles: ["System"],
+                steps: [
+                    { id: "step_1", type: "task", taskKind: "robotTask", role: "System", next: ["step_2"] },
+                    { id: "step_2", type: "end", role: "System" }
+                ]
+            }),
+        /Unbekannter taskKind/
+    );
+});
+
+test("normalizeProcessJson keeps distinct tasks when taskKind differs", () => {
+    const normalized = normalizeProcessJson({
+        roles: ["System"],
+        steps: [
+            { id: "step_1", type: "task", taskKind: "userTask", label: "Genehmigen", role: "System", next: ["step_3"] },
+            { id: "step_2", type: "task", taskKind: "serviceTask", label: "Genehmigen", role: "System", next: ["step_3"] },
+            { id: "step_3", type: "end", label: "Ende", role: "System" }
+        ]
+    });
+
+    assert.ok(normalized.steps.some((s) => s.id === "step_1"));
+    assert.ok(normalized.steps.some((s) => s.id === "step_2"));
+});
+
+test("normalizeProcessJson filters annotations to valid attachTo", () => {
+    const normalized = normalizeProcessJson({
+        roles: ["System"],
+        steps: [
+            { id: "step_1", type: "task", label: "A", role: "System", next: ["step_2"] },
+            { id: "step_2", type: "end", label: "E", role: "System" }
+        ],
+        annotations: [
+            { id: "ann_ok", text: "Hinweis zum Schritt", attachTo: "step_1" },
+            { id: "ann_bad", text: "Unbekannt", attachTo: "step_999" }
+        ]
+    });
+
+    assert.equal(normalized.annotations.length, 1);
+    assert.equal(normalized.annotations[0].attachTo, "step_1");
+});

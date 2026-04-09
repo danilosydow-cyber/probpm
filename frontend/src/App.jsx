@@ -255,53 +255,72 @@ function App() {
         });
     };
 
-    // Initialize editor and palette on load
     useEffect(() => {
-        if (!containerRef.current || modelerRef.current) return;
+        const container = containerRef.current;
+        if (!container) return;
 
-        modelerRef.current = new BpmnModeler({
-            container: containerRef.current,
+        const modeler = new BpmnModeler({
+            container,
             additionalModules: [customPaletteModule, customTranslateModule]
         });
+        modelerRef.current = modeler;
 
-        modelerRef.current.createDiagram()
+        let cancelled = false;
+
+        modeler
+            .createDiagram()
             .then(() => {
+                if (cancelled) return;
                 attachPalette();
                 setupPaletteInteraction();
                 applyPaletteGroupLabels();
                 applyElementColors();
                 bindColoringListeners();
-                modelerRef.current.get("canvas").zoom("fit-viewport");
+                modeler.get("canvas").zoom("fit-viewport");
             })
             .catch((err) => {
-                console.error("BPMN Init Fehler:", err);
+                if (!cancelled) {
+                    console.error("BPMN Init Fehler:", err);
+                }
             });
-    }, []);
 
-    // Import generated XML once available
-    useEffect(() => {
-        if (!xml || !modelerRef.current) return;
-        modelerRef.current.importXML(xml)
-            .then(() => {
-                attachPalette();
-                setupPaletteInteraction();
-                applyPaletteGroupLabels();
-                applyElementColors();
-                modelerRef.current.get("canvas").zoom("fit-viewport");
-            })
-            .catch(err => {
-                console.error("BPMN Fehler:", err);
-            });
-    }, [xml]);
-
-    useEffect(() => {
         return () => {
-            if (modelerRef.current) {
-                modelerRef.current.destroy();
+            cancelled = true;
+            coloringListenersBoundRef.current = false;
+            if (modelerRef.current === modeler) {
+                modeler.destroy();
                 modelerRef.current = null;
             }
         };
     }, []);
+
+    useEffect(() => {
+        if (!xml) return;
+        const modeler = modelerRef.current;
+        if (!modeler) return;
+
+        let cancelled = false;
+
+        modeler
+            .importXML(xml)
+            .then(() => {
+                if (cancelled) return;
+                attachPalette();
+                setupPaletteInteraction();
+                applyPaletteGroupLabels();
+                applyElementColors();
+                modeler.get("canvas").zoom("fit-viewport");
+            })
+            .catch((err) => {
+                if (!cancelled) {
+                    console.error("BPMN Fehler:", err);
+                }
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [xml]);
 
     const handleAnalyze = async () => {
         const trimmedText = text.trim();

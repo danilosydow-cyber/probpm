@@ -5,10 +5,10 @@
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "npm --prefix backend start",
     "dev:frontend": "npm --prefix frontend run dev",
-    "start": "npm run dev"
+    "start": "npm run dev",
+    "test": "npm --prefix backend test"
   },
   "devDependencies": {
-    "concurrently": "^9.2.1",
-    "vite": "^5.0.0"
+    "concurrently": "^9.2.1"
   }
 }

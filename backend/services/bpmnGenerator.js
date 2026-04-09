@@ -1,3 +1,5 @@
+import { buildActivityElementXml, PROBPM_EMAIL_NS } from "./bpmnSemantics.js";
+
 function escapeXml(value) {
     return String(value)
         .replaceAll("&", "&amp;")
@@ -106,9 +108,10 @@ function dedupeFlows(flows) {
 function getNodeSize(step) {
     const isGateway = step?.type === "gateway";
     const isStart = step?.type === "startEvent";
+    const isBoundary = step?.type === "boundaryTimer";
     return {
-        width: isGateway ? 50 : isStart ? 36 : 100,
-        height: isGateway ? 50 : isStart ? 36 : 60
+        width: isGateway ? 50 : isStart || isBoundary ? 36 : 100,
+        height: isGateway ? 50 : isStart || isBoundary ? 36 : 60
     };
 }
 
@@ -1008,8 +1011,11 @@ function computeMainPath(startId, flows, rank) {
 
 export function generateBPMN(process) {
     const roles = Array.isArray(process?.roles) && process.roles.length > 0 ? process.roles : ["System"];
+    const processAnnotations = Array.isArray(process?.annotations)
+        ? JSON.parse(JSON.stringify(process.annotations))
+        : [];
     const steps = JSON.parse(JSON.stringify(process?.steps || []));
-    const stepById = new Map(steps.map((step) => [step.id, step]));
+    let stepById = new Map(steps.map((step) => [step.id, step]));
 
     const flows = [];
     steps.forEach((step) => {
@@ -1055,7 +1061,7 @@ export function generateBPMN(process) {
     startCandidates.forEach((step) => {
         flows.unshift({ from: startId, to: step.id });
     });
-    const normalizedFlows = dedupeFlows(flows);
+    let normalizedFlows = dedupeFlows(flows);
 
     const roleMap = {};
     roles.forEach((role, i) => {
@@ -1082,7 +1088,44 @@ export function generateBPMN(process) {
         step._roleId = roleId;
     });
 
+    const liveById = new Map(steps.map((step) => [step.id, step]));
+    steps.forEach((step) => {
+        if (step.type === "startEvent" || step.type === "gateway" || step.type === "endEvent") return;
+        const timers = Array.isArray(step.boundaryTimers) ? step.boundaryTimers : [];
+        timers.forEach((bt, i) => {
+            const target = typeof bt?.target === "string" ? bt.target : "";
+            if (!target || !liveById.has(target)) return;
+            const bid = `${step.id}_timer_${i}`;
+            if (liveById.has(bid)) return;
+            const interrupting = bt.interrupting !== false;
+            const durationRaw = typeof bt.duration === "string" ? bt.duration.trim().slice(0, 120) : "";
+            const bstep = {
+                id: bid,
+                type: "boundaryTimer",
+                label: compactLabel(bt.label || "Timer", 3) || "Timer",
+                hostId: step.id,
+                boundaryTarget: target,
+                role: step.role,
+                _roleId: step._roleId,
+                interrupting,
+                duration: durationRaw || undefined
+            };
+            steps.push(bstep);
+            liveById.set(bid, bstep);
+            roleMap[step._roleId].steps.push(bid);
+            normalizedFlows.push({ from: bid, to: target });
+        });
+    });
+    normalizedFlows = dedupeFlows(normalizedFlows);
+
+    stepById = new Map(steps.map((step) => [step.id, step]));
+
     const rank = computeStepRank(steps, normalizedFlows, startId);
+    steps.forEach((step) => {
+        if (step.type === "boundaryTimer" && step.hostId && rank[step.hostId] != null) {
+            rank[step.id] = rank[step.hostId];
+        }
+    });
     const mainPath = computeMainPath(startId, normalizedFlows, rank);
     const mainPathIndex = new Map(mainPath.map((stepId, idx) => [stepId, idx]));
     const mainEdges = new Set();
@@ -1095,6 +1138,7 @@ export function generateBPMN(process) {
 
     const roleRankGroups = new Map();
     steps.forEach((step) => {
+        if (step.type === "boundaryTimer") return;
         const currentRank = rank[step.id] || 1;
         const key = `${step._roleId}:${currentRank}`;
         const group = roleRankGroups.get(key) || [];
@@ -1154,6 +1198,7 @@ export function generateBPMN(process) {
 
 
     steps.forEach((step) => {
+        if (step.type === "boundaryTimer") return;
         step._isMain = mainPathIndex.has(step.id);
         const lane = laneMeta[step._roleId];
         const currentRank = rank[step.id] || 1;
@@ -1177,6 +1222,19 @@ export function generateBPMN(process) {
                 : BASE_X + currentRank * RANK_SPACING
         );
         positions[step.id] = { x, y };
+    });
+
+    steps.forEach((step) => {
+        if (step.type !== "boundaryTimer") return;
+        const hostPos = positions[step.hostId];
+        const hostStep = stepById.get(step.hostId);
+        if (!hostPos || !hostStep) return;
+        const hs = getNodeSize(hostStep);
+        const bs = getNodeSize(step);
+        positions[step.id] = {
+            x: snap(hostPos.x + hs.width / 2 - bs.width / 2),
+            y: snap(hostPos.y + hs.height - Math.floor(bs.height / 2))
+        };
     });
 
     // Keep simple same-role chains visually straight on one axis.
@@ -1318,7 +1376,41 @@ export function generateBPMN(process) {
         });
     }
     const shiftedMaxX = contentMaxX + shiftX;
-    const diagramWidth = snap(Math.max(540, shiftedMaxX - LANE_X + LANE_SIDE_PADDING));
+    let diagramWidth = snap(Math.max(540, shiftedMaxX - LANE_X + LANE_SIDE_PADDING));
+
+    const annotationLayouts = [];
+    let annCounter = 0;
+    processAnnotations.forEach((ann) => {
+        const attachId = typeof ann.attachTo === "string" ? ann.attachTo : "";
+        const hostStep = stepById.get(attachId);
+        if (!attachId || !positions[attachId] || !hostStep) return;
+        annCounter += 1;
+        const aid = typeof ann.id === "string" && ann.id.trim() ? ann.id.trim() : `TextAnn_${annCounter}`;
+        const textRaw = String(ann.text ?? ann.label ?? "Hinweis").trim();
+        const textDisplay = compactLabel(textRaw, 40) || "Hinweis";
+        const pos = positions[attachId];
+        const sz = getNodeSize(hostStep);
+        const tw = Math.min(300, Math.max(96, textDisplay.length * 6 + 32));
+        const th = 72;
+        const ax = snap(pos.x + sz.width + 24);
+        const ay = snap(pos.y + 6);
+        annotationLayouts.push({
+            id: aid,
+            text: escapeXml(textDisplay),
+            attachTo: attachId,
+            x: ax,
+            y: ay,
+            w: tw,
+            h: th
+        });
+    });
+
+    if (annotationLayouts.length > 0) {
+        const maxAnnRight = Math.max(...annotationLayouts.map((a) => a.x + a.w));
+        const minW = snap(maxAnnRight - LANE_X + LANE_SIDE_PADDING + 40);
+        if (minW > diagramWidth) diagramWidth = minW;
+    }
+
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions
 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -1326,6 +1418,7 @@ xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
 xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
 xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
 xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+xmlns:probpm="${PROBPM_EMAIL_NS}"
 id="Defs_1">
 <bpmn:process id="Process_1" isExecutable="false">`;
 
@@ -1348,14 +1441,26 @@ id="Defs_1">
         } else if (step.type === "gateway") {
             const gatewayName = name === "undefined" ? "Entscheidung" : name;
             xml += `<bpmn:exclusiveGateway id="${step.id}" name="${gatewayName}" />`;
+        } else if (step.type === "boundaryTimer") {
+            const cancel = step.interrupting === false ? "false" : "true";
+            const dur = typeof step.duration === "string" && step.duration
+                ? `<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">${escapeXml(step.duration)}</bpmn:timeDuration>`
+                : "";
+            xml += `<bpmn:boundaryEvent id="${step.id}" name="${name}" attachedToRef="${step.hostId}" cancelActivity="${cancel}"><bpmn:timerEventDefinition>${dur}</bpmn:timerEventDefinition></bpmn:boundaryEvent>`;
         } else {
-            xml += `<bpmn:task id="${step.id}" name="${name}" />`;
+            xml += buildActivityElementXml(step, name);
         }
     });
 
     normalizedFlows.forEach((flow, i) => {
         const name = flow.condition ? ` name="${escapeXml(flow.condition)}"` : "";
         xml += `<bpmn:sequenceFlow id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}"${name} />`;
+    });
+
+    annotationLayouts.forEach((ann) => {
+        const assocId = `Association_${ann.id}`;
+        xml += `<bpmn:textAnnotation id="${ann.id}"><bpmn:text>${ann.text}</bpmn:text></bpmn:textAnnotation>`;
+        xml += `<bpmn:association id="${assocId}" sourceRef="${ann.id}" targetRef="${ann.attachTo}" />`;
     });
 
     xml += `</bpmn:process><bpmndi:BPMNDiagram><bpmndi:BPMNPlane bpmnElement="Process_1">`;
@@ -1387,6 +1492,10 @@ id="Defs_1">
         const labelX = snap(pos.x + width / 2 - labelWidth / 2);
         const labelY = snap(pos.y + height + SHAPE_LABEL_GAP);
         xml += `<bpmndi:BPMNShape bpmnElement="${step.id}"><dc:Bounds x="${pos.x}" y="${pos.y}" width="${width}" height="${height}" /><bpmndi:BPMNLabel><dc:Bounds x="${labelX}" y="${labelY}" width="${labelWidth}" height="18" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>`;
+    });
+
+    annotationLayouts.forEach((ann) => {
+        xml += `<bpmndi:BPMNShape bpmnElement="${ann.id}"><dc:Bounds x="${ann.x}" y="${ann.y}" width="${ann.w}" height="${ann.h}" /></bpmndi:BPMNShape>`;
     });
 
     const outgoingIndexMeta = buildOutgoingIndex(normalizedFlows, positions, stepsById);
@@ -1476,6 +1585,18 @@ id="Defs_1">
             ? `<bpmndi:BPMNLabel><dc:Bounds x="${labelBounds.x}" y="${labelBounds.y}" width="${labelBounds.width}" height="${labelBounds.height}" /></bpmndi:BPMNLabel>`
             : "";
         xml += `<bpmndi:BPMNEdge bpmnElement="flow_${i}">${waypointXml}${labelXml}</bpmndi:BPMNEdge>`;
+    });
+
+    annotationLayouts.forEach((ann) => {
+        const tPos = positions[ann.attachTo];
+        const tSize = getNodeSize(stepsById.get(ann.attachTo));
+        if (!tPos || !tSize) return;
+        const x1 = snap(ann.x);
+        const y1 = snap(ann.y + ann.h / 2);
+        const x2 = snap(tPos.x + tSize.width / 2);
+        const y2 = snap(tPos.y + tSize.height / 2);
+        const assocId = `Association_${ann.id}`;
+        xml += `<bpmndi:BPMNEdge bpmnElement="${assocId}"><di:waypoint x="${x1}" y="${y1}" /><di:waypoint x="${x2}" y="${y2}" /></bpmndi:BPMNEdge>`;
     });
 
     xml += `</bpmndi:BPMNPlane></bpmndi:BPMNDiagram></bpmn:definitions>`;

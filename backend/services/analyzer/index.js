@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 
+import { MIN_PROCESS_TEXT_CHARS } from "../../constants.js";
 import { AppError, badRequest } from "../../utils/apiErrors.js";
 import { buildAnalyzePrompt } from "./prompt.js";
 import { parseAnalyzerResponse } from "./parseResponse.js";
@@ -11,8 +12,8 @@ const client = new OpenAI({
 });
 
 export async function analyzeTextToProcess(text) {
-    if (!text || text.trim().length < 5) {
-        throw badRequest("Text zu kurz fuer Analyse", { minLength: 5 }, "TEXT_TOO_SHORT");
+    if (!text || text.trim().length < MIN_PROCESS_TEXT_CHARS) {
+        throw badRequest("Text zu kurz fuer Analyse", { minLength: MIN_PROCESS_TEXT_CHARS }, "TEXT_TOO_SHORT");
     }
 
     const prompt = buildAnalyzePrompt(text.trim());

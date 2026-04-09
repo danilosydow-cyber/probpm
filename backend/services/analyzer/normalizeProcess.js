@@ -1,3 +1,5 @@
+import { sanitizeTaskKind } from "../bpmnSemantics.js";
+
 function compactLabel(value, maxWords = 3) {
     const text = String(value || "").trim().replace(/\s+/g, " ");
     if (!text) return "";
@@ -117,8 +119,9 @@ function mergeDuplicateTasksByLabel(json) {
         if (!step?.id) return null;
         const label = String(step?.label || "").trim().toLowerCase();
         const role = String(step?.role || "").trim().toLowerCase();
+        const kind = String(step?.taskKind || "task").trim().toLowerCase();
         if (!label || !role) return null;
-        return `${role}::${label}`;
+        return `${role}::${label}::${kind}`;
     };
 
     const canonicalIdByKey = new Map();
@@ -160,6 +163,12 @@ function mergeDuplicateTasksByLabel(json) {
             step.conditions = step.conditions.map((cond) => ({
                 ...cond,
                 target: typeof cond?.target === "string" ? resolveId(cond.target) : cond.target
+            }));
+        }
+        if (Array.isArray(step.boundaryTimers)) {
+            step.boundaryTimers = step.boundaryTimers.map((bt) => ({
+                ...bt,
+                target: typeof bt?.target === "string" ? resolveId(bt.target) : bt.target
             }));
         }
     });
@@ -236,6 +245,62 @@ function removeTransitiveDirectEdges(json) {
     });
 }
 
+function normalizeEmailBlock(email) {
+    if (!email || typeof email !== "object") return undefined;
+    const out = {};
+    for (const key of ["to", "recipient", "cc", "bcc", "from", "sender", "subject", "template", "body"]) {
+        if (email[key] != null && typeof email[key] === "string") {
+            const trimmed = email[key].trim();
+            if (trimmed) {
+                if (key === "recipient") out.to = trimmed;
+                else if (key === "sender") out.from = trimmed;
+                else out[key] = trimmed;
+            }
+        }
+    }
+    if (email.noBcsStyling === true) out.noBcsStyling = true;
+    return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeBoundaryTimersOnStep(step, validIds) {
+    if (!Array.isArray(step.boundaryTimers)) return { ...step, boundaryTimers: [] };
+    const cleaned = [];
+    step.boundaryTimers.forEach((bt) => {
+        const target = typeof bt?.target === "string" ? bt.target : "";
+        if (!validIds.has(target)) return;
+        cleaned.push({
+            label: compactLabel(bt?.label || "Timer", 3) || "Timer",
+            target,
+            interrupting: bt.interrupting !== false,
+            duration: typeof bt?.duration === "string" ? bt.duration.trim().slice(0, 80) : undefined
+        });
+    });
+    return { ...step, boundaryTimers: cleaned };
+}
+
+function normalizeAnnotationsBlock(json) {
+    const steps = json.steps || [];
+    const validIds = new Set(steps.map((s) => s?.id).filter(Boolean));
+    const raw = json.annotations;
+    if (!Array.isArray(raw)) {
+        json.annotations = [];
+        return;
+    }
+    let n = 0;
+    json.annotations = raw
+        .filter((a) => a && typeof a.attachTo === "string" && validIds.has(a.attachTo))
+        .map((a) => {
+            n += 1;
+            const idRaw = typeof a.id === "string" ? a.id.trim() : "";
+            const safeId = idRaw && /^[A-Za-z_][A-Za-z0-9_]*$/.test(idRaw) ? idRaw : `ann_${n}`;
+            return {
+                id: safeId,
+                text: compactLabel(String(a.text ?? a.label ?? "").trim(), 24) || "Hinweis",
+                attachTo: a.attachTo
+            };
+        });
+}
+
 export function normalizeProcessJson(processJson) {
     const normalized = JSON.parse(JSON.stringify(processJson));
 
@@ -245,14 +310,46 @@ export function normalizeProcessJson(processJson) {
     });
 
     normalized.roles = (normalized.roles || []).map((role) => compactLabel(role, 3) || "Rolle");
-    normalized.steps = (normalized.steps || []).map((step, index) => ({
-        ...step,
-        label: compactLabel(step?.label, 3) || `Schritt ${index + 1}`
-    }));
+
+    normalized.steps = (normalized.steps || []).map((step, index) => {
+        const t = String(step?.type || "").toLowerCase();
+        const isActivity = t !== "gateway" && t !== "end" && t !== "endevent";
+        const nextStep = {
+            ...step,
+            label: compactLabel(step?.label, 3) || `Schritt ${index + 1}`
+        };
+        if (isActivity) {
+            nextStep.taskKind = sanitizeTaskKind(step?.taskKind);
+            const doc = typeof step?.documentation === "string" ? step.documentation.trim() : "";
+            if (doc) {
+                nextStep.documentation = doc.slice(0, 2000);
+            } else {
+                delete nextStep.documentation;
+            }
+            const email = normalizeEmailBlock(step?.email);
+            if (email) nextStep.email = email;
+            else delete nextStep.email;
+        } else {
+            delete nextStep.taskKind;
+            delete nextStep.email;
+            delete nextStep.boundaryTimers;
+            delete nextStep.documentation;
+        }
+        return nextStep;
+    });
 
     normalizeConnections(normalized);
     buildConsistentRoles(normalized);
     mergeDuplicateTasksByLabel(normalized);
     removeTransitiveDirectEdges(normalized);
+
+    const validIdsAfter = new Set(normalized.steps.map((s) => s?.id).filter(Boolean));
+    normalized.steps = normalized.steps.map((step) => {
+        const t = String(step?.type || "").toLowerCase();
+        if (t === "gateway" || t === "end" || t === "endevent") return step;
+        return normalizeBoundaryTimersOnStep(step, validIdsAfter);
+    });
+
+    normalizeAnnotationsBlock(normalized);
     return normalized;
 }
