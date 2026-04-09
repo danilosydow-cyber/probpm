@@ -1,4 +1,4 @@
-import { MIN_PROCESS_TEXT_CHARS } from "../constants.js";
+import { MAX_PROCESS_TEXT_CHARS, MIN_PROCESS_TEXT_CHARS } from "../constants.js";
 import { badRequest } from "../utils/apiErrors.js";
 
 export function validateTextInput(req, _res, next) {
@@ -18,6 +18,15 @@ export function validateTextInput(req, _res, next) {
             badRequest(`Bitte gib einen Text mit mindestens ${MIN_PROCESS_TEXT_CHARS} Zeichen an.`, {
                 field: "text",
                 minLength: MIN_PROCESS_TEXT_CHARS
+            })
+        );
+    }
+
+    if (normalized.length > MAX_PROCESS_TEXT_CHARS) {
+        return next(
+            badRequest(`Text zu lang (maximal ${MAX_PROCESS_TEXT_CHARS} Zeichen).`, {
+                field: "text",
+                maxLength: MAX_PROCESS_TEXT_CHARS
             })
         );
     }

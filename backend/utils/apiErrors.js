@@ -29,7 +29,7 @@ export function toErrorResponse(error) {
         status: 500,
         body: {
             success: false,
-            error: error?.message || "Interner Serverfehler",
+            error: "Interner Serverfehler",
             code: "INTERNAL_ERROR"
         }
     };

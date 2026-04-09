@@ -6,7 +6,7 @@ import cors from "cors";
 import { createAnalyzeRouter } from "./routes/analyze.js";
 import { createGenerateRouter } from "./routes/generate.js";
 import { analyzeTextToProcess } from "./services/analyzer.js";
-import { toErrorResponse } from "./utils/apiErrors.js";
+import { AppError, toErrorResponse } from "./utils/apiErrors.js";
 
 const defaultPort = Number(process.env.PORT) || 5000;
 
@@ -14,12 +14,16 @@ export function createApp({ analyzeText = analyzeTextToProcess } = {}) {
     const app = express();
 
     app.use(cors());
-    app.use(express.json());
+    app.use(express.json({ limit: "512kb" }));
 
     app.use("/api/analyze", createAnalyzeRouter({ analyzeText }));
     app.use("/api/generate", createGenerateRouter({ analyzeText }));
 
     app.use((err, _req, res, _next) => {
+        const clientError = err instanceof AppError && err.status < 500;
+        if (!clientError) {
+            console.error(err);
+        }
         const mapped = toErrorResponse(err);
         res.status(mapped.status).json(mapped.body);
     });
