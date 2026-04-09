@@ -1,32 +1,25 @@
 import express from "express";
 import { analyzeTextToProcess } from "../services/analyzer.js";
+import { validateTextInput } from "../middleware/validateTextInput.js";
 
-const router = express.Router();
+export function createAnalyzeRouter({ analyzeText = analyzeTextToProcess } = {}) {
+    const router = express.Router();
 
-router.post("/", async (req, res) => {
+    router.post("/", validateTextInput, async (req, res, next) => {
+        try {
+            const process = await analyzeText(req.validatedText);
 
-    try {
-        const { text } = req.body;
-        if (typeof text !== "string" || text.trim().length < 5) {
-            return res.status(400).json({
-                success: false,
-                error: "Bitte gib einen Text mit mindestens 5 Zeichen an."
+            res.json({
+                success: true,
+                json: process
             });
+        } catch (err) {
+            next(err);
         }
+    });
 
-        const process = await analyzeTextToProcess(text.trim());
+    return router;
+}
 
-        res.json({
-            success: true,
-            json: process
-        });
-
-    } catch (err) {
-        res.status(500).json({
-            success: false,
-            error: err?.message || "Interner Serverfehler"
-        });
-    }
-});
-
-export default router;
+const defaultRouter = createAnalyzeRouter();
+export default defaultRouter;

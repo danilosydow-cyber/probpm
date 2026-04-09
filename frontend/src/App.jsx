@@ -76,6 +76,7 @@ function App() {
     const paletteHostRef = useRef(null);
     const modelerRef = useRef(null);
     const activePaletteEntryRef = useRef(null);
+    const coloringListenersBoundRef = useRef(false);
 
     const attachPalette = () => {
         if (!containerRef.current || !paletteHostRef.current) return;
@@ -111,6 +112,100 @@ function App() {
         });
     };
 
+    const applyPaletteGroupLabels = () => {
+        if (!paletteHostRef.current) return;
+        const entriesContainer = paletteHostRef.current.querySelector(".djs-palette-entries");
+        if (!entriesContainer) return;
+
+        const categoryConfig = {
+            system: { label: "System", order: 1 },
+            tools: { label: "Tools", order: 2 },
+            activities: { label: "Aktivitäten", order: 3 },
+            gateways: { label: "Gateways", order: 4 },
+            roles: { label: "Rollen", order: 5 },
+            resources: { label: "Ressourcen", order: 6 }
+        };
+
+        const sortSystemEntries = (group) => {
+            const priority = [
+                "bpmn-icon-start-event",
+                "bpmn-icon-intermediate-event-catch-timer",
+                "bpmn-icon-intermediate-event-catch-message",
+                "bpmn-icon-intermediate-event-catch-signal",
+                "bpmn-icon-intermediate-event-none",
+                "bpmn-icon-end-event-message",
+                "bpmn-icon-end-event-terminate",
+                "bpmn-icon-group"
+            ];
+            const entries = Array.from(group.querySelectorAll(".entry"));
+            entries
+                .map((entry) => {
+                    const idx = priority.findIndex((marker) => entry.className.includes(marker));
+                    return { entry, idx: idx === -1 ? 999 : idx };
+                })
+                .sort((a, b) => a.idx - b.idx)
+                .forEach(({ entry }) => group.appendChild(entry));
+        };
+
+        const classifyEntry = (entry) => {
+            const cls = entry.className || "";
+
+            if (cls.includes("palette-system")) return "system";
+            if (cls.includes("palette-activity")) return "activities";
+            if (cls.includes("palette-gateway")) return "gateways";
+            if (cls.includes("palette-role")) return "roles";
+            if (cls.includes("palette-resource")) return "resources";
+
+            if (
+                cls.includes("bpmn-icon-start-event")
+                || cls.includes("bpmn-icon-end-event")
+                || cls.includes("bpmn-icon-intermediate-event")
+                || cls.includes("bpmn-icon-boundary-event")
+                || cls.includes("bpmn-icon-group")
+            ) {
+                return "system";
+            }
+
+            return "tools";
+        };
+
+        const visibleEntries = Array.from(entriesContainer.querySelectorAll(".entry"))
+            .filter((entry) => window.getComputedStyle(entry).display !== "none");
+
+        const entriesByCategory = new Map();
+        Object.keys(categoryConfig).forEach((key) => entriesByCategory.set(key, []));
+
+        visibleEntries.forEach((entry) => {
+            const category = classifyEntry(entry);
+            if (!entriesByCategory.has(category)) {
+                entriesByCategory.set(category, []);
+            }
+            entriesByCategory.get(category).push(entry);
+        });
+
+        entriesContainer.querySelectorAll(".group").forEach((group) => group.remove());
+
+        Object.entries(categoryConfig)
+            .sort((a, b) => a[1].order - b[1].order)
+            .forEach(([categoryKey, meta]) => {
+                const entries = entriesByCategory.get(categoryKey) || [];
+                if (entries.length === 0) return;
+
+                const group = document.createElement("div");
+                group.className = "group palette-group-labeled";
+                group.setAttribute("data-category-label", meta.label);
+                group.setAttribute("data-category-key", categoryKey);
+
+                entries.forEach((entry) => group.appendChild(entry));
+
+                if (categoryKey === "system") {
+                    sortSystemEntries(group);
+                }
+
+                entriesContainer.appendChild(group);
+            });
+    };
+
     const applyElementColor = (element) => {
         if (!modelerRef.current || !element) return;
         const modeling = modelerRef.current.get("modeling");
@@ -133,6 +228,33 @@ function App() {
         });
     };
 
+    const bindColoringListeners = () => {
+        if (!modelerRef.current || coloringListenersBoundRef.current) return;
+        coloringListenersBoundRef.current = true;
+
+        const eventBus = modelerRef.current.get("eventBus");
+        const scheduleApplyColor = (element) => {
+            if (!element) return;
+            window.setTimeout(() => applyElementColor(element), 0);
+        };
+
+        eventBus.on("commandStack.shape.create.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.shape);
+            clearActivePaletteEntry();
+        });
+        eventBus.on("commandStack.shape.append.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.shape);
+            clearActivePaletteEntry();
+        });
+        eventBus.on("commandStack.elements.create.postExecuted", ({ context }) => {
+            (context?.elements || []).forEach(scheduleApplyColor);
+            clearActivePaletteEntry();
+        });
+        eventBus.on("commandStack.shape.replace.postExecuted", ({ context }) => {
+            scheduleApplyColor(context?.newShape);
+        });
+    };
+
     // Initialize editor and palette on load
     useEffect(() => {
         if (!containerRef.current || modelerRef.current) return;
@@ -142,34 +264,13 @@ function App() {
             additionalModules: [customPaletteModule, customTranslateModule]
         });
 
-        const scheduleApplyColor = (element) => {
-            if (!element) return;
-            setTimeout(() => applyElementColor(element), 0);
-        };
-
-        const eventBus = modelerRef.current.get("eventBus");
-        eventBus.on("shape.added", ({ element }) => {
-            scheduleApplyColor(element);
-            clearActivePaletteEntry();
-        });
-        eventBus.on("commandStack.shape.create.postExecuted", ({ context }) => {
-            scheduleApplyColor(context?.shape);
-        });
-        eventBus.on("commandStack.shape.append.postExecuted", ({ context }) => {
-            scheduleApplyColor(context?.shape);
-        });
-        eventBus.on("commandStack.elements.create.postExecuted", ({ context }) => {
-            (context?.elements || []).forEach(scheduleApplyColor);
-        });
-        eventBus.on("commandStack.shape.replace.postExecuted", ({ context }) => {
-            scheduleApplyColor(context?.newShape);
-        });
-
         modelerRef.current.createDiagram()
             .then(() => {
                 attachPalette();
                 setupPaletteInteraction();
+                applyPaletteGroupLabels();
                 applyElementColors();
+                bindColoringListeners();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })
             .catch((err) => {
@@ -184,6 +285,7 @@ function App() {
             .then(() => {
                 attachPalette();
                 setupPaletteInteraction();
+                applyPaletteGroupLabels();
                 applyElementColors();
                 modelerRef.current.get("canvas").zoom("fit-viewport");
             })

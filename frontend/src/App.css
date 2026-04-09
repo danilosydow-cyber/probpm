@@ -70,11 +70,11 @@
 
 .palette-host {
   margin-top: 10px;
-  height: 132px;
+  height: 114px;
   border: 1px solid #d5d9e3;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.96);
-  padding: 8px 10px;
+  padding: 6px 8px;
   overflow-x: auto;
   overflow-y: hidden;
   box-sizing: border-box;
@@ -98,28 +98,53 @@
   flex-direction: row !important;
   flex-wrap: nowrap !important;
   align-items: flex-start !important;
-  gap: 8px;
+  gap: 6px;
   width: max-content !important;
   min-width: max-content !important;
 }
 
 .palette-host .djs-palette .djs-palette-entries .group {
   display: grid !important;
-  grid-template-rows: repeat(2, 48px);
+  grid-template-rows: repeat(2, 42px);
   grid-auto-flow: column;
-  grid-auto-columns: 48px;
-  gap: 4px;
+  grid-auto-columns: 42px;
+  gap: 3px;
   align-items: center;
   align-content: center;
   border-right: 1px solid #e5e8ef;
-  padding-right: 8px;
-  margin-right: 8px;
+  padding-right: 6px;
+  padding-bottom: 16px;
+  margin-right: 6px;
+  position: relative;
 }
 
 .palette-host .djs-palette .djs-palette-entries .group:last-child {
   border-right: none;
   padding-right: 0;
   margin-right: 0;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group.palette-group-labeled::after {
+  content: attr(data-category-label);
+  position: absolute;
+  left: 0;
+  right: 8px;
+  bottom: 0;
+  text-align: center;
+  font-size: 9px;
+  line-height: 1;
+  color: #4f5b72;
+  font-weight: 700;
+  letter-spacing: 0.35px;
+  text-transform: uppercase;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group:last-child.palette-group-labeled::after {
+  right: 0;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group:not(.palette-group-labeled) {
+  display: none !important;
 }
 
 .palette-host .djs-palette .djs-palette-entries .entry,
@@ -133,11 +158,11 @@
 }
 
 .palette-host .djs-palette .entry {
-  width: 48px;
-  height: 48px;
-  line-height: 48px;
-  font-size: 32px;
-  border-radius: 6px;
+  width: 42px;
+  height: 42px;
+  line-height: 42px;
+  font-size: 28px;
+  border-radius: 5px;
   border: 1px solid #d8dbe3;
   transition: transform 120ms ease, box-shadow 160ms ease, filter 160ms ease;
   transform-origin: center;
@@ -145,7 +170,7 @@
 }
 
 .palette-host .djs-palette .entry::before {
-  line-height: 48px;
+  line-height: 42px;
 }
 
 .palette-host .djs-palette .entry:hover {
@@ -180,6 +205,65 @@
 .palette-host .djs-palette .entry.palette-resource {
   background: #f3e5f5;
   border-color: #7b1fa2;
+}
+
+.palette-host .djs-palette .entry.palette-system {
+  background: #f8fafc;
+  border-color: #aeb8c8;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="system"] {
+  background: linear-gradient(180deg, rgba(247, 249, 253, 0.85), rgba(242, 246, 252, 0.85));
+  border-radius: 8px;
+  padding-left: 6px;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="system"] .entry {
+  background: #f8fafc;
+  border-color: #aeb8c8;
+  color: #44506a;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="system"] .entry::before {
+  color: inherit;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="activities"] .entry {
+  background: #e3f2fd;
+  border-color: #1565c0;
+  color: #1f4e8f;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="gateways"] .entry {
+  background: #fff9c4;
+  border-color: #f9a825;
+  color: #8a5a00;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="roles"] .entry {
+  background: #e8f5e9;
+  border-color: #2e7d32;
+  color: #225d26;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="resources"] .entry {
+  background: #f3e5f5;
+  border-color: #7b1fa2;
+  color: #5a1778;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="tools"] .entry {
+  background: #f7f8fb;
+  border-color: #b4bccb;
+  color: #4b566c;
+}
+
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="activities"] .entry::before,
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="gateways"] .entry::before,
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="roles"] .entry::before,
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="resources"] .entry::before,
+.palette-host .djs-palette .djs-palette-entries .group[data-category-key="tools"] .entry::before {
+  color: inherit;
 }
 
 .palette-host .djs-palette .entry.bpmn-icon-gateway-none {

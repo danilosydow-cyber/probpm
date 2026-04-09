@@ -3,9 +3,11 @@ import 'dotenv/config';
 import express from "express";
 import cors from "cors";
 
-import analyzeRoute from "./routes/analyze.js";
+import { createAnalyzeRouter } from "./routes/analyze.js";
 import { analyzeTextToProcess } from "./services/analyzer.js";
 import { generateBPMN } from "./services/bpmnGenerator.js";
+import { validateTextInput } from "./middleware/validateTextInput.js";
+import { toErrorResponse } from "./utils/apiErrors.js";
 
 const defaultPort = Number(process.env.PORT) || 5000;
 
@@ -16,46 +18,27 @@ export function createApp({ analyzeText = analyzeTextToProcess } = {}) {
     app.use(cors());
     app.use(express.json());
 
-    // =====================================================
-    // 🧠 ROUTE: NUR JSON (bestehend lassen)
-    // =====================================================
-    app.use("/api/analyze", analyzeRoute);
+    app.use("/api/analyze", createAnalyzeRouter({ analyzeText }));
 
 
-    // =====================================================
-    // 🔥 FULL PIPELINE: TEXT → JSON → BPMN XML (Dual Prompt)
-    // =====================================================
-    app.post("/api/generate", async (req, res) => {
+    app.post("/api/generate", validateTextInput, async (req, res, next) => {
         try {
-            const { text } = req.body;
-
-            if (typeof text !== "string" || text.trim().length < 5) {
-                return res.status(400).json({
-                    success: false,
-                    error: "Bitte gib einen Text mit mindestens 5 Zeichen an."
-                });
-            }
-
-            const process = await analyzeText(text.trim());
+            const process = await analyzeText(req.validatedText);
             const xml = generateBPMN(process);
 
-            // =========================
-            // 🔥 STEP 5 – RESPONSE
-            // =========================
             res.json({
                 success: true,
                 json: process,
                 xml
             });
-
         } catch (err) {
-            console.error("❌ Fehler in /api/generate:", err);
-
-            res.status(500).json({
-                success: false,
-                error: err?.message || "Interner Serverfehler"
-            });
+            next(err);
         }
+    });
+
+    app.use((err, _req, res, _next) => {
+        const mapped = toErrorResponse(err);
+        res.status(mapped.status).json(mapped.body);
     });
 
     return app;
@@ -64,7 +47,7 @@ export function createApp({ analyzeText = analyzeTextToProcess } = {}) {
 export function startServer(port = defaultPort) {
     const app = createApp();
     return app.listen(port, () => {
-        console.log(`🚀 Server läuft auf Port ${port}`);
+        console.log(`Server laeuft auf Port ${port}`);
     });
 }
 

@@ -9,10 +9,11 @@ class CustomPaletteProvider {
 
     getPaletteEntries() {
         const paletteClassByGroup = {
-            activity: "palette-activity",
-            gateway: "palette-gateway",
-            collaboration: "palette-role",
-            resource: "palette-resource"
+            system: "palette-system",
+            activities: "palette-activity",
+            gateways: "palette-gateway",
+            roles: "palette-role",
+            resources: "palette-resource"
         };
 
         const createAction = (type, className, title, options = {}) => {
@@ -58,9 +59,9 @@ class CustomPaletteProvider {
             "create.start-message": createAction(
                 "bpmn:StartEvent",
                 "bpmn-icon-start-event-message",
-                "Startereignis: Nachricht",
+                "Prozessstart per Nachricht",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:StartEvent", "bpmn:MessageEventDefinition")
                 }
@@ -68,9 +69,9 @@ class CustomPaletteProvider {
             "create.end-message": createAction(
                 "bpmn:EndEvent",
                 "bpmn-icon-end-event-message",
-                "Endereignis: Nachricht",
+                "Prozessende mit Nachricht",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:EndEvent", "bpmn:MessageEventDefinition")
                 }
@@ -78,9 +79,9 @@ class CustomPaletteProvider {
             "create.end-terminate": createAction(
                 "bpmn:EndEvent",
                 "bpmn-icon-end-event-terminate",
-                "Endereignis: Abbruch",
+                "Sofortiges Prozessende",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:EndEvent", "bpmn:TerminateEventDefinition")
                 }
@@ -88,17 +89,17 @@ class CustomPaletteProvider {
             "create.intermediate-none": createAction(
                 "bpmn:IntermediateCatchEvent",
                 "bpmn-icon-intermediate-event-none",
-                "Zwischenereignis",
+                "Zwischenereignis ohne Auslöser",
                 {
-                    group: "event"
+                    group: "system"
                 }
             ),
             "create.intermediate-timer": createAction(
                 "bpmn:IntermediateCatchEvent",
                 "bpmn-icon-intermediate-event-catch-timer",
-                "Zwischenereignis: Zeit",
+                "Zwischenereignis mit Zeitsteuerung",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:IntermediateCatchEvent", "bpmn:TimerEventDefinition")
                 }
@@ -106,9 +107,9 @@ class CustomPaletteProvider {
             "create.intermediate-message": createAction(
                 "bpmn:IntermediateCatchEvent",
                 "bpmn-icon-intermediate-event-catch-message",
-                "Zwischenereignis: Nachricht",
+                "Zwischenereignis mit Nachricht",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:IntermediateCatchEvent", "bpmn:MessageEventDefinition")
                 }
@@ -116,9 +117,9 @@ class CustomPaletteProvider {
             "create.intermediate-signal": createAction(
                 "bpmn:IntermediateCatchEvent",
                 "bpmn-icon-intermediate-event-catch-signal",
-                "Zwischenereignis: Signal",
+                "Zwischenereignis mit Signal",
                 {
-                    group: "event",
+                    group: "system",
                     businessObjectFactory: () =>
                         createEventWithDefinition("bpmn:IntermediateCatchEvent", "bpmn:SignalEventDefinition")
                 }
@@ -126,56 +127,65 @@ class CustomPaletteProvider {
             "create.task": createAction(
                 "bpmn:Task",
                 "bpmn-icon-task",
-                "Aktivität",
+                "Manuelle Aktivität",
                 {
-                    group: "activity"
+                    group: "activities"
                 }
             ),
             "create.subprocess-collapsed": createAction(
                 "bpmn:SubProcess",
                 "bpmn-icon-subprocess-collapsed",
-                "Subprozess (kollabiert)",
+                "Kompakter Subprozess",
                 {
-                    group: "activity",
+                    group: "activities",
                     shape: { isExpanded: false }
+                }
+            ),
+            "create.subprocess-expanded": createAction(
+                "bpmn:SubProcess",
+                "bpmn-icon-subprocess-expanded",
+                "Erweiterter Subprozess",
+                {
+                    group: "activities",
+                    shape: { isExpanded: true }
                 }
             ),
             "create.service-task": createAction(
                 "bpmn:ServiceTask",
                 "bpmn-icon-service-task",
                 "Automatische Aktivität",
-                { group: "activity" }
+                { group: "activities" }
             ),
             "create.gateway-exclusive": createAction(
                 "bpmn:ExclusiveGateway",
                 "bpmn-icon-gateway-xor",
-                "Gateway: Exklusiv (X)",
-                { group: "gateway" }
+                "Exklusive Entscheidung (XOR)",
+                { group: "gateways" }
             ),
             "create.gateway-parallel": createAction(
                 "bpmn:ParallelGateway",
                 "bpmn-icon-gateway-parallel",
-                "Gateway: Parallel (+)",
-                { group: "gateway" }
+                "Parallele Verzweigung (AND)",
+                { group: "gateways" }
             ),
             "create.gateway-event-based": createAction(
                 "bpmn:EventBasedGateway",
                 "bpmn-icon-gateway-eventbased",
-                "Gateway: Ereignisbasiert",
-                { group: "gateway" }
+                "Ereignisbasierte Entscheidung",
+                { group: "gateways" }
             ),
             "create.data-store-reference": createAction(
                 "bpmn:DataStoreReference",
                 "bpmn-icon-data-store",
-                "Datenbank",
-                { group: "resource" }
+                "Persistente Datenbank",
+                { group: "resources" }
             ),
             "create.participant-collapsed": createAction(
                 "bpmn:Participant",
                 "bpmn-icon-lane",
-                "Schwimmbahn/Pool (eingeklappt)",
+                "Rolle als Pool/Lane",
                 {
-                    group: "collaboration",
+                    group: "roles",
                     shapeFactory: (businessObject) =>
                         this.elementFactory.createParticipantShape({
                             type: "bpmn:Participant",
