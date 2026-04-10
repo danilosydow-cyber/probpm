@@ -232,6 +232,22 @@
 
 .editor-heading {
   margin-top: 28px;
+  margin-bottom: 0;
+}
+
+.editor-heading-row {
+  margin-top: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editor-heading-row .editor-heading {
+  margin-top: 0;
+}
+
+.editor-relayout-button {
+  padding: 8px 12px;
 }
 
 .editor-stats {
@@ -560,4 +576,20 @@
 
 .palette-host .djs-palette.two-column.open {
   width: 100% !important;
+}
+
+.viewer-panel .djs-context-pad.open {
+  margin-left: 10px;
+}
+
+.viewer-panel .djs-context-pad .entry {
+  width: 22px;
+  height: 22px;
+  line-height: 22px;
+  font-size: 13px;
+  margin: 1px;
+}
+
+.viewer-panel .djs-context-pad .entry::before {
+  line-height: 22px;
 }

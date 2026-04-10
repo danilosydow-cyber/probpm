@@ -108,10 +108,11 @@ function dedupeFlows(flows) {
 function getNodeSize(step) {
     const isGateway = step?.type === "gateway";
     const isStart = step?.type === "startEvent";
+    const isEnd = step?.type === "endEvent";
     const isBoundary = step?.type === "boundaryTimer";
     return {
-        width: isGateway ? 50 : isStart || isBoundary ? 36 : 100,
-        height: isGateway ? 50 : isStart || isBoundary ? 36 : 60
+        width: isGateway ? 50 : isStart || isEnd || isBoundary ? 36 : 100,
+        height: isGateway ? 50 : isStart || isEnd || isBoundary ? 36 : 60
     };
 }
 
@@ -916,6 +917,19 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions) {
 }
 
 function enforceGatewaySplitPattern(flowWaypoints, flows, stepsById) {
+    const outgoingBySource = new Map();
+    flows.forEach((flow, idx) => {
+        const list = outgoingBySource.get(flow.from) || [];
+        list.push({ ...flow, flowIndex: idx });
+        outgoingBySource.set(flow.from, list);
+    });
+    const flowOrderByIndex = new Map();
+    outgoingBySource.forEach((list) => {
+        list.forEach((item, localIndex) => {
+            flowOrderByIndex.set(item.flowIndex, { localIndex, total: list.length });
+        });
+    });
+
     return flowWaypoints.map((points, index) => {
         const flow = flows[index];
         if (!flow || !Array.isArray(points) || points.length < 2) return points;
@@ -934,6 +948,17 @@ function enforceGatewaySplitPattern(flowWaypoints, flows, stepsById) {
 
         if (branchKind === "no" && result[2]) {
             result[2].y = start.y;
+        }
+
+        // Keep one gateway branch visibly on the main axis after the first segment.
+        const meta = flowOrderByIndex.get(index) || { localIndex: 0, total: 1 };
+        const isPrimaryBranch = meta.total > 1 && meta.localIndex === 0;
+        if (isPrimaryBranch) {
+            if (!result[2]) {
+                result.push({ x: snap(result[1].x + 24), y: start.y });
+            } else if (result[2].y !== start.y) {
+                result.splice(2, 0, { x: snap(Math.max(result[1].x + 24, start.x + 48)), y: start.y });
+            }
         }
 
         return result;
@@ -1149,6 +1174,7 @@ export function generateBPMN(process) {
     const positions = {};
     const laneMeta = {};
     const STEP_SLOT = 84;
+    const LANE_BRANCH_OFFSET = 84;
     const LANE_PADDING = 16;
     const LANE_BASE_HEIGHT = 84;
     const LANE_GAP = 16;
@@ -1168,6 +1194,28 @@ export function generateBPMN(process) {
     const RANK_SPACING = isLinearLike ? 196 : hasGateway ? 260 : 224;
     const BASE_X = isLinearLike ? 156 : 180;
 
+    const gatewayBranchOffsetByTarget = new Map();
+    const outgoingBySourceList = new Map();
+    normalizedFlows.forEach((flow) => {
+        const list = outgoingBySourceList.get(flow.from) || [];
+        list.push(flow);
+        outgoingBySourceList.set(flow.from, list);
+    });
+    steps.forEach((step) => {
+        if (step.type !== "gateway") return;
+        const sourceRoleId = step._roleId;
+        const outgoing = (outgoingBySourceList.get(step.id) || [])
+            .filter((flow) => stepByIdWithStart.get(flow.to)?._roleId === sourceRoleId);
+        if (outgoing.length <= 1) return;
+        outgoing.forEach((flow, idx) => {
+            if (gatewayBranchOffsetByTarget.has(flow.to)) return;
+            const offset = idx === 0
+                ? 0
+                : (idx % 2 === 1 ? 1 : -1) * Math.ceil(idx / 2) * LANE_BRANCH_OFFSET;
+            gatewayBranchOffsetByTarget.set(flow.to, offset);
+        });
+    });
+
     Object.values(roleMap).forEach((role) => {
         const groupSizes = [];
         roleRankGroups.forEach((group, key) => {
@@ -1181,7 +1229,13 @@ export function generateBPMN(process) {
             maxFanOut = Math.max(maxFanOut, outgoingBySource.get(stepId) || 1);
         });
 
+        const maxGatewayFanOut = role.steps.reduce((max, stepId) => {
+            const s = stepByIdWithStart.get(stepId);
+            if (s?.type !== "gateway") return max;
+            return Math.max(max, (outgoingBySourceList.get(stepId) || []).length);
+        }, 1);
         const branchBuffer = Math.max(0, maxFanIn - 1) * 18 + Math.max(0, maxFanOut - 1) * 14;
+        const gatewayBranchBuffer = Math.max(0, maxGatewayFanOut - 1) * 30;
         const maxStack = Math.max(1, ...groupSizes);
         const stackHeight = (maxStack - 1) * STEP_SLOT + 60;
         const hasGateway = role.steps.some((stepId) => stepByIdWithStart.get(stepId)?.type === "gateway");
@@ -1189,7 +1243,7 @@ export function generateBPMN(process) {
         const height = snap(
             Math.max(
                 LANE_BASE_HEIGHT,
-                stackHeight + LANE_PADDING * 2 + branchBuffer + gatewayBuffer
+                stackHeight + LANE_PADDING * 2 + branchBuffer + gatewayBuffer + gatewayBranchBuffer
             )
         );
         laneMeta[role.id] = { y: currentY, height };
@@ -1212,9 +1266,16 @@ export function generateBPMN(process) {
         const minY = lane.y + LANE_PADDING;
         const maxY = lane.y + lane.height - LANE_PADDING - effectiveBlockHeight;
         const isMainNode = step._isMain;
+        const branchOffset = gatewayBranchOffsetByTarget.get(step.id) || 0;
+        const isGatewayNode = step.type === "gateway";
+        const nonGatewayOffset = gatewayBranchOffsetByTarget.has(step.id)
+            ? branchOffset
+            : centeredOffset * STEP_SLOT;
         const rawY = isMainNode
             ? laneCenterY - effectiveBlockHeight / 2
-            : laneCenterY - height / 2 + centeredOffset * STEP_SLOT;
+            : isGatewayNode
+                ? laneCenterY - height / 2 + centeredOffset * STEP_SLOT
+                : laneCenterY - height / 2 + nonGatewayOffset;
         const y = snap(Math.max(minY, Math.min(maxY, rawY)));
         const x = snap(
             mainPathIndex.has(step.id)
@@ -1544,6 +1605,13 @@ id="Defs_1">
     for (let refinePass = 0; refinePass < 2; refinePass += 1) {
         refinedWaypoints = resolveInterFlowCrossings(refinedWaypoints, normalizedFlows, stepsById);
         refinedWaypoints = enforceOrthogonalWaypoints(refinedWaypoints, normalizedFlows, stepsById);
+        refinedWaypoints = resolveFlowOverShapeIntersections(
+            refinedWaypoints,
+            normalizedFlows,
+            stepRects,
+            laneBounds,
+            stepsById
+        );
     }
     const withGatewayDiagonals = enforceGatewayExitDiagonals(refinedWaypoints, normalizedFlows, stepsById);
     const finalWaypoints = enforceDominantForwardEdges(
@@ -1563,8 +1631,16 @@ id="Defs_1">
         stepsById,
         positions
     );
+    const postEndpointResolved = resolveInterFlowCrossings(endpointSafeWaypoints, normalizedFlows, stepsById);
+    const postEndpointOrthogonal = enforceOrthogonalWaypoints(postEndpointResolved, normalizedFlows, stepsById);
+    const finalEndpointWaypoints = enforceFlowEndpoints(
+        postEndpointOrthogonal,
+        normalizedFlows,
+        stepsById,
+        positions
+    );
     normalizedFlows.forEach((flow, i) => {
-        const waypoints = compactOrthogonalWaypoints(endpointSafeWaypoints[i] || []);
+        const waypoints = compactOrthogonalWaypoints(finalEndpointWaypoints[i] || []);
         if (!waypoints || waypoints.length === 0) return;
         const waypointXml = waypoints
             .map((point) => `<di:waypoint x="${snap(point.x)}" y="${snap(point.y)}" />`)

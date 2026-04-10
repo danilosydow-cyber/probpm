@@ -34,6 +34,15 @@ const ACTIVITY_TYPES = new Set([
     "bpmn:SubProcess",
     "bpmn:CallActivity"
 ]);
+const SPECIALIZED_TASK_TYPES = new Set([
+    "bpmn:UserTask",
+    "bpmn:ManualTask",
+    "bpmn:ScriptTask",
+    "bpmn:BusinessRuleTask",
+    "bpmn:SendTask",
+    "bpmn:ReceiveTask",
+    "bpmn:ServiceTask"
+]);
 
 const ROLE_TYPES = new Set(["bpmn:Participant", "bpmn:Lane"]);
 const RESOURCE_TYPES = new Set(["bpmn:DataObjectReference", "bpmn:DataStoreReference", "bpmn:DataStore"]);
@@ -286,11 +295,20 @@ function App() {
         }
     };
 
+    const enforceNeutralTaskType = (element) => {
+        if (!modelerRef.current || !element?.type) return;
+        if (!SPECIALIZED_TASK_TYPES.has(element.type)) return;
+        const bpmnReplace = modelerRef.current.get("bpmnReplace");
+        if (!bpmnReplace) return;
+        bpmnReplace.replaceElement(element, { type: "bpmn:Task" });
+    };
+
     const applyElementColors = () => {
         if (!modelerRef.current) return;
         const elementRegistry = modelerRef.current.get("elementRegistry");
 
         elementRegistry.forEach((element) => {
+            enforceNeutralTaskType(element);
             applyElementColor(element);
         });
     };
@@ -306,18 +324,24 @@ function App() {
         };
 
         eventBus.on("commandStack.shape.create.postExecuted", ({ context }) => {
+            enforceNeutralTaskType(context?.shape);
             scheduleApplyColor(context?.shape);
             clearActivePaletteEntry();
         });
         eventBus.on("commandStack.shape.append.postExecuted", ({ context }) => {
+            enforceNeutralTaskType(context?.shape);
             scheduleApplyColor(context?.shape);
             clearActivePaletteEntry();
         });
         eventBus.on("commandStack.elements.create.postExecuted", ({ context }) => {
-            (context?.elements || []).forEach(scheduleApplyColor);
+            (context?.elements || []).forEach((element) => {
+                enforceNeutralTaskType(element);
+                scheduleApplyColor(element);
+            });
             clearActivePaletteEntry();
         });
         eventBus.on("commandStack.shape.replace.postExecuted", ({ context }) => {
+            enforceNeutralTaskType(context?.newShape);
             scheduleApplyColor(context?.newShape);
         });
     };
@@ -431,6 +455,204 @@ function App() {
 
     const handleAnalyze = async () => {
         await runAnalysis(text);
+    };
+
+    const relayoutCurrentDiagram = async () => {
+        const modeler = modelerRef.current;
+        if (!modeler) return false;
+
+        const elementRegistry = modeler.get("elementRegistry");
+        const modeling = modeler.get("modeling");
+
+        const lanes = [];
+        const sequenceFlows = [];
+        const nodes = [];
+
+        elementRegistry.forEach((element) => {
+            if (!element || element.labelTarget) return;
+            if (isBpmnType(element, "bpmn:Lane")) {
+                lanes.push(element);
+                return;
+            }
+            if (isBpmnType(element, "bpmn:SequenceFlow")) {
+                sequenceFlows.push(element);
+                return;
+            }
+            if (
+                isBpmnType(element, "bpmn:Activity")
+                || isBpmnType(element, "bpmn:Gateway")
+                || isBpmnType(element, "bpmn:Event")
+            ) {
+                nodes.push(element);
+            }
+        });
+
+        if (lanes.length === 0 || nodes.length === 0) return false;
+
+        const laneRows = lanes
+            .map((lane) => ({ lane, y: lane.y, h: lane.height }))
+            .sort((a, b) => a.y - b.y);
+
+        const laneNodes = new Map(laneRows.map(({ lane }) => [lane.id, []]));
+        const laneByNodeId = new Map();
+        nodes.forEach((node) => {
+            const centerY = node.y + node.height / 2;
+            const row = laneRows.find(({ y, h }) => centerY >= y && centerY <= y + h);
+            if (!row) return;
+            laneNodes.get(row.lane.id).push(node);
+            laneByNodeId.set(node.id, row.lane);
+        });
+
+        const branchOffsetByTarget = new Map();
+        sequenceFlows.forEach((flow) => {
+            const source = flow.source;
+            const target = flow.target;
+            if (!source || !target) return;
+            if (!isBpmnType(source, "bpmn:Gateway")) return;
+            const srcLane = laneByNodeId.get(source.id);
+            const tgtLane = laneByNodeId.get(target.id);
+            if (!srcLane || !tgtLane || srcLane.id !== tgtLane.id) return;
+            const key = source.id;
+            if (!branchOffsetByTarget.has(key)) {
+                branchOffsetByTarget.set(key, new Map());
+            }
+            const branchMap = branchOffsetByTarget.get(key);
+            if (branchMap.has(target.id)) return;
+            const idx = branchMap.size;
+            const offset = idx === 0 ? 0 : (idx % 2 === 1 ? 1 : -1) * Math.ceil(idx / 2) * 84;
+            branchMap.set(target.id, offset);
+        });
+
+        const targetPosById = new Map();
+        const LANE_PADDING = 18;
+        const BRANCH_VERTICAL_OFFSET = 120;
+        laneRows.forEach(({ lane, y, h }) => {
+            const laneCenterY = y + h / 2;
+            const rowNodes = laneNodes.get(lane.id) || [];
+            rowNodes.forEach((node) => {
+                const baseY = laneCenterY - node.height / 2;
+                let branchOffset = 0;
+                sequenceFlows.forEach((flow) => {
+                    if (flow.target?.id !== node.id) return;
+                    const branchMap = branchOffsetByTarget.get(flow.source?.id);
+                    if (!branchMap) return;
+                    if (branchMap.has(node.id)) {
+                        branchOffset = branchMap.get(node.id);
+                    }
+                });
+                const isGateway = isBpmnType(node, "bpmn:Gateway");
+                const minY = y + LANE_PADDING;
+                const maxY = y + h - LANE_PADDING - node.height;
+                const effectiveBranchOffset = Math.max(
+                    -BRANCH_VERTICAL_OFFSET * 2,
+                    Math.min(BRANCH_VERTICAL_OFFSET * 2, branchOffset)
+                );
+                const targetY = Math.max(minY, Math.min(maxY, isGateway ? baseY : baseY + effectiveBranchOffset));
+                targetPosById.set(node.id, { x: node.x, y: targetY });
+            });
+
+            const byRow = new Map();
+            rowNodes.forEach((node) => {
+                const pos = targetPosById.get(node.id);
+                if (!pos) return;
+                const rowKey = Math.round((pos.y + node.height / 2) / 36);
+                if (!byRow.has(rowKey)) byRow.set(rowKey, []);
+                byRow.get(rowKey).push(node);
+            });
+
+            byRow.forEach((bucketNodes) => {
+                bucketNodes.sort((a, b) => (targetPosById.get(a.id)?.x || a.x) - (targetPosById.get(b.id)?.x || b.x));
+                for (let i = 1; i < bucketNodes.length; i += 1) {
+                    const prev = bucketNodes[i - 1];
+                    const curr = bucketNodes[i];
+                    const prevPos = targetPosById.get(prev.id);
+                    const currPos = targetPosById.get(curr.id);
+                    if (!prevPos || !currPos) continue;
+                    const minX = prevPos.x + prev.width + 44;
+                    if (currPos.x < minX) {
+                        currPos.x = minX;
+                    }
+                }
+            });
+
+            // Hard collision resolver per lane: ensure node rectangles do not overlap.
+            const lanePlaced = rowNodes
+                .map((node) => ({ node, pos: targetPosById.get(node.id) }))
+                .filter(({ pos }) => Boolean(pos));
+            const overlaps = (a, b, margin = 10) => (
+                a.x < (b.x + b.w + margin)
+                && (a.x + a.w + margin) > b.x
+                && a.y < (b.y + b.h + margin)
+                && (a.y + a.h + margin) > b.y
+            );
+
+            for (let pass = 0; pass < 8; pass += 1) {
+                let changed = false;
+                for (let i = 0; i < lanePlaced.length; i += 1) {
+                    for (let j = i + 1; j < lanePlaced.length; j += 1) {
+                        const a = lanePlaced[i];
+                        const b = lanePlaced[j];
+                        const aRect = { x: a.pos.x, y: a.pos.y, w: a.node.width, h: a.node.height };
+                        const bRect = { x: b.pos.x, y: b.pos.y, w: b.node.width, h: b.node.height };
+                        if (!overlaps(aRect, bRect)) continue;
+
+                        // Prefer vertical separation inside lane; fallback to horizontal push.
+                        const laneMinY = y + LANE_PADDING;
+                        const laneMaxYForB = y + h - LANE_PADDING - b.node.height;
+                        const laneMaxYForA = y + h - LANE_PADDING - a.node.height;
+                        const moveDown = Math.max(18, (aRect.y + aRect.h + 12) - bRect.y);
+                        const canMoveBDown = b.pos.y + moveDown <= laneMaxYForB;
+                        const canMoveAUp = a.pos.y - moveDown >= laneMinY;
+
+                        if (canMoveBDown) {
+                            b.pos.y += moveDown;
+                            changed = true;
+                        } else if (canMoveAUp) {
+                            a.pos.y -= moveDown;
+                            changed = true;
+                        } else if (a.pos.y + a.node.height / 2 <= b.pos.y + b.node.height / 2) {
+                            b.pos.x = Math.max(b.pos.x, a.pos.x + a.node.width + 52);
+                            changed = true;
+                        } else {
+                            a.pos.x = Math.max(a.pos.x, b.pos.x + b.node.width + 52);
+                            if (a.pos.y > laneMaxYForA) a.pos.y = laneMaxYForA;
+                            changed = true;
+                        }
+                    }
+                }
+                if (!changed) break;
+            }
+        });
+
+        const movable = nodes.filter((node) => targetPosById.has(node.id));
+        movable.forEach((node) => {
+            const target = targetPosById.get(node.id);
+            const dx = Math.round(target.x - node.x);
+            const dy = Math.round(target.y - node.y);
+            if (dx !== 0 || dy !== 0) {
+                modeling.moveElements([node], { x: dx, y: dy });
+            }
+        });
+
+        modeler.get("canvas").zoom("fit-viewport");
+        return movable.length > 0;
+    };
+
+    const handleRelayout = async () => {
+        setError("");
+        setStatus("Ordne Elemente neu an...");
+        const relayoutDone = await relayoutCurrentDiagram();
+        if (relayoutDone) {
+            setStatus("Layout erfolgreich neu angeordnet.");
+            return;
+        }
+        const trimmedText = String(text || "").trim();
+        if (trimmedText.length < 5) {
+            setError("Für Neu-Anordnung bitte zuerst einen Prozess-Text eingeben.");
+            setStatus("Neu-Anordnung fehlgeschlagen.");
+            return;
+        }
+        await runAnalysis(trimmedText);
     };
 
     const extractTextFromPdf = async (file) => {
@@ -948,7 +1170,17 @@ function App() {
                 </div>
             ) : null}
 
-            <h2 className="editor-heading">BPMN-Editor</h2>
+            <div className="editor-heading-row">
+                <h2 className="editor-heading">BPMN-Editor</h2>
+                <button
+                    type="button"
+                    className="analyze-button editor-relayout-button"
+                    onClick={handleRelayout}
+                    disabled={isLoading || isExtractingDocument}
+                >
+                    Layout neu anordnen
+                </button>
+            </div>
             <div ref={paletteHostRef} className="palette-host" />
             <div ref={containerRef} className="viewer-panel" />
 
