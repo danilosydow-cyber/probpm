@@ -127,7 +127,7 @@ class CustomPaletteProvider {
             "create.task": createAction(
                 "bpmn:Task",
                 "bpmn-icon-task",
-                "Manuelle Aktivität",
+                "Standard-Aktivität",
                 {
                     group: "activities"
                 }
@@ -140,21 +140,6 @@ class CustomPaletteProvider {
                     group: "activities",
                     shape: { isExpanded: false }
                 }
-            ),
-            "create.subprocess-expanded": createAction(
-                "bpmn:SubProcess",
-                "bpmn-icon-subprocess-expanded",
-                "Erweiterter Subprozess",
-                {
-                    group: "activities",
-                    shape: { isExpanded: true }
-                }
-            ),
-            "create.service-task": createAction(
-                "bpmn:ServiceTask",
-                "bpmn-icon-service-task",
-                "Automatische Aktivität",
-                { group: "activities" }
             ),
             "create.gateway-exclusive": createAction(
                 "bpmn:ExclusiveGateway",

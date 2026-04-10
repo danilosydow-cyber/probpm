@@ -1,10 +1,18 @@
 import BpmnModeler from "bpmn-js/lib/Modeler";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
+import { jsPDF } from "jspdf";
+import { svg2pdf } from "svg2pdf.js";
+import mammoth from "mammoth";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "./App.css";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn.css";
 import { customPaletteModule } from "./bpmn/customPaletteProvider";
 import { customTranslateModule } from "./bpmn/customTranslateModule";
+import appLogo from "./assets/probpm-logo.png";
+
+GlobalWorkerOptions.workerSrc = pdfWorker;
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
@@ -29,8 +37,52 @@ const ACTIVITY_TYPES = new Set([
 
 const ROLE_TYPES = new Set(["bpmn:Participant", "bpmn:Lane"]);
 const RESOURCE_TYPES = new Set(["bpmn:DataObjectReference", "bpmn:DataStoreReference", "bpmn:DataStore"]);
+const GERMAN_STOPWORDS = new Set([
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einer", "eines", "einem", "einen",
+    "und", "oder", "aber", "sonst", "wenn", "falls", "ist", "sind", "war", "waren", "wird", "werden",
+    "wurde", "wurden", "hat", "haben", "hatte", "hatten", "sein", "bin", "bist", "seid", "am", "im",
+    "in", "an", "auf", "zu", "mit", "von", "für", "bei", "als", "auch", "noch", "nur",
+    "er", "sie", "es", "wir", "ihr", "ich", "du", "man", "mich", "dich", "sich", "uns", "euch",
+    "mein", "dein", "sein", "ihr", "unser", "euer", "kein", "keine", "nicht"
+]);
 
 const isBpmnType = (element, bpmnType) => element?.businessObject?.$instanceOf?.(bpmnType);
+const escapeHtml = (value) => String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const tokenizeWords = (input) => String(input || "").match(/[\p{L}][\p{L}\p{N}-]*/gu) || [];
+const normalizeWord = (word) => String(word || "").toLowerCase().trim();
+
+const getStemFromVerbLikeTerm = (word) => normalizeWord(word)
+    .replace(/(ieren|ern|eln|en|n)$/u, "")
+    .replace(/(test|tet|ten|te|st|t)$/u, "");
+
+const buildVerbVariants = (word) => {
+    const normalized = normalizeWord(word);
+    if (!normalized || normalized.length < 3) return [];
+
+    const variants = new Set([normalized]);
+    const stem = getStemFromVerbLikeTerm(normalized);
+    if (stem.length >= 4) {
+        variants.add(stem);
+
+        const suffixes = ["t", "te", "ten", "tet", "ter", "tes", "en", "end", "ung"];
+        suffixes.forEach((suffix) => variants.add(`${stem}${suffix}`));
+
+        const separablePrefixes = ["zurueck", "zurück", "weiter", "ab", "an", "auf", "aus", "bei", "ein", "mit", "nach", "vor", "zu"];
+        const prefix = separablePrefixes.find((candidate) => stem.startsWith(candidate) && stem.length > candidate.length + 2);
+        if (prefix) {
+            const base = stem.slice(prefix.length);
+            variants.add(`${prefix}ge${base}t`);
+        } else {
+            variants.add(`ge${stem}t`);
+        }
+    }
+
+    return Array.from(variants);
+};
 
 const getColorByElement = (element) => {
     const type = element?.type;
@@ -71,12 +123,23 @@ function App() {
     const [error, setError] = useState("");
     const [status, setStatus] = useState("Bereit");
     const [isLoading, setIsLoading] = useState(false);
+    const [showDownloadOptions, setShowDownloadOptions] = useState(false);
+    const [isExporting, setIsExporting] = useState(false);
+    const [isExtractingDocument, setIsExtractingDocument] = useState(false);
+    const [isDragOverEditor, setIsDragOverEditor] = useState(false);
+    const [allocationSearch, setAllocationSearch] = useState("");
+    const [allocationElementFilter, setAllocationElementFilter] = useState("all");
+    const [allocationSortBy, setAllocationSortBy] = useState("source");
 
     const containerRef = useRef(null);
     const paletteHostRef = useRef(null);
     const modelerRef = useRef(null);
+    const textAreaRef = useRef(null);
+    const highlightRef = useRef(null);
+    const lineNumbersRef = useRef(null);
     const activePaletteEntryRef = useRef(null);
     const coloringListenersBoundRef = useRef(false);
+    const fileInputRef = useRef(null);
 
     const attachPalette = () => {
         if (!containerRef.current || !paletteHostRef.current) return;
@@ -171,6 +234,10 @@ function App() {
 
         const visibleEntries = Array.from(entriesContainer.querySelectorAll(".entry"))
             .filter((entry) => window.getComputedStyle(entry).display !== "none");
+
+        if (visibleEntries.length === 0) {
+            return;
+        }
 
         const entriesByCategory = new Map();
         Object.keys(categoryConfig).forEach((key) => entriesByCategory.set(key, []));
@@ -322,14 +389,15 @@ function App() {
         };
     }, [xml]);
 
-    const handleAnalyze = async () => {
-        const trimmedText = text.trim();
+    const runAnalysis = async (inputText) => {
+        const trimmedText = String(inputText || "").trim();
         if (trimmedText.length < 5) {
             setError("Bitte gib mindestens 5 Zeichen ein.");
             return;
         }
 
         setError("");
+        setShowDownloadOptions(true);
         setStatus("Analysiere Prozess...");
         setIsLoading(true);
         try {
@@ -361,37 +429,629 @@ function App() {
         }
     };
 
+    const handleAnalyze = async () => {
+        await runAnalysis(text);
+    };
+
+    const extractTextFromPdf = async (file) => {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await getDocument({ data: arrayBuffer }).promise;
+        const pages = [];
+
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
+            const page = await pdf.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items
+                .map((item) => (typeof item.str === "string" ? item.str : ""))
+                .join(" ")
+                .replace(/\s+/g, " ")
+                .trim();
+            if (pageText) {
+                pages.push(pageText);
+            }
+        }
+
+        return pages.join("\n\n");
+    };
+
+    const extractTextFromDocx = async (file) => {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer });
+        return (result.value || "").replace(/\r/g, "").trim();
+    };
+
+    const extractTextFromPlainFile = async (file) => {
+        return (await file.text()).replace(/\r/g, "").trim();
+    };
+
+    const processUploadedFile = async (file) => {
+        if (!file) return;
+
+        const fileName = file.name || "Dokument";
+        const lowerName = fileName.toLowerCase();
+        setError("");
+        setIsExtractingDocument(true);
+        setStatus(`Extrahiere Text aus ${fileName}...`);
+
+        try {
+            let extractedText = "";
+
+            if (lowerName.endsWith(".pdf")) {
+                extractedText = await extractTextFromPdf(file);
+            } else if (lowerName.endsWith(".docx")) {
+                extractedText = await extractTextFromDocx(file);
+            } else if (
+                lowerName.endsWith(".txt")
+                || lowerName.endsWith(".md")
+                || lowerName.endsWith(".json")
+                || lowerName.endsWith(".csv")
+            ) {
+                extractedText = await extractTextFromPlainFile(file);
+            } else {
+                throw new Error("Nicht unterstütztes Dateiformat. Bitte PDF, DOCX, TXT, MD, CSV oder JSON verwenden.");
+            }
+
+            if (!extractedText || extractedText.trim().length === 0) {
+                throw new Error("Es konnte kein Text aus dem Dokument extrahiert werden.");
+            }
+
+            setText(extractedText);
+            setStatus(`Text aus ${fileName} erfolgreich geladen.`);
+            await runAnalysis(extractedText);
+        } catch (err) {
+            setError(err?.message || "Dokument konnte nicht verarbeitet werden.");
+            setStatus("Dokument-Extraktion fehlgeschlagen.");
+        } finally {
+            setIsExtractingDocument(false);
+        }
+    };
+
+    const handleUploadDocument = async (event) => {
+        const file = event.target.files?.[0];
+        await processUploadedFile(file);
+        if (event.target) {
+            event.target.value = "";
+        }
+    };
+
+    const handleEditorDragOver = (event) => {
+        event.preventDefault();
+        setIsDragOverEditor(true);
+    };
+
+    const handleEditorDragLeave = (event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) {
+            setIsDragOverEditor(false);
+        }
+    };
+
+    const handleEditorDrop = async (event) => {
+        event.preventDefault();
+        setIsDragOverEditor(false);
+        const file = event.dataTransfer?.files?.[0];
+        if (file) {
+            await processUploadedFile(file);
+        }
+    };
+
+    const triggerDownload = (blob, fileName) => {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    };
+
+    const getCurrentBpmnXml = async () => {
+        if (!modelerRef.current) {
+            throw new Error("Editor ist noch nicht initialisiert.");
+        }
+        const { xml: latestXml } = await modelerRef.current.saveXML({ format: true });
+        return latestXml;
+    };
+
+    const getCurrentSvg = async () => {
+        if (!modelerRef.current) {
+            throw new Error("Editor ist noch nicht initialisiert.");
+        }
+        const { svg } = await modelerRef.current.saveSVG();
+        return svg;
+    };
+
+    const handleDownloadBpmn = async () => {
+        try {
+            setError("");
+            setIsExporting(true);
+            const latestXml = await getCurrentBpmnXml();
+            triggerDownload(new Blob([latestXml], { type: "application/xml" }), "prozessmodell.bpmn");
+            setStatus("BPMN-Datei wurde heruntergeladen.");
+        } catch (err) {
+            setError(err?.message || "BPMN-Export fehlgeschlagen.");
+            setStatus("BPMN-Export fehlgeschlagen.");
+        } finally {
+            setIsExporting(false);
+        }
+    };
+
+    const handleDownloadSvg = async () => {
+        try {
+            setError("");
+            setIsExporting(true);
+            const svg = await getCurrentSvg();
+            triggerDownload(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), "prozessmodell.svg");
+            setStatus("SVG-Datei wurde heruntergeladen.");
+        } catch (err) {
+            setError(err?.message || "SVG-Export fehlgeschlagen.");
+            setStatus("SVG-Export fehlgeschlagen.");
+        } finally {
+            setIsExporting(false);
+        }
+    };
+
+    const handleDownloadPdf = async () => {
+        try {
+            setError("");
+            setIsExporting(true);
+            const svgMarkup = await getCurrentSvg();
+            const svgDoc = new DOMParser().parseFromString(svgMarkup, "image/svg+xml");
+            const svgElement = svgDoc.documentElement;
+
+            const viewBox = (svgElement.getAttribute("viewBox") || "0 0 1200 800")
+                .split(/\s+/)
+                .map((value) => Number(value) || 0);
+            const width = viewBox[2] > 0 ? viewBox[2] : 1200;
+            const height = viewBox[3] > 0 ? viewBox[3] : 800;
+
+            const pdf = new jsPDF({
+                orientation: width >= height ? "landscape" : "portrait",
+                unit: "pt",
+                format: [width, height]
+            });
+
+            await svg2pdf(svgElement, pdf, {
+                x: 0,
+                y: 0,
+                width,
+                height
+            });
+
+            triggerDownload(pdf.output("blob"), "prozessmodell.pdf");
+            setStatus("PDF-Datei wurde heruntergeladen.");
+        } catch (err) {
+            setError(err?.message || "PDF-Export fehlgeschlagen.");
+            setStatus("PDF-Export fehlgeschlagen.");
+        } finally {
+            setIsExporting(false);
+        }
+    };
+
+    const processWordCount = useMemo(() => {
+        return text
+            .split(/\s+/)
+            .map((token) => token.trim().toLowerCase().replace(/[^\p{L}\p{N}-]/gu, ""))
+            .filter((token) => token.length >= 2)
+            .filter((token) => !GERMAN_STOPWORDS.has(token))
+            .length;
+    }, [text]);
+
+    const totalWordCount = useMemo(() => {
+        return text
+            .split(/\s+/)
+            .map((token) => token.trim())
+            .filter((token) => token.length > 0)
+            .length;
+    }, [text]);
+
+    const textLineCount = useMemo(() => {
+        return Math.max(6, text.split(/\r?\n/).length);
+    }, [text]);
+
+    const rolesCount = useMemo(() => {
+        const roles = json?.roles;
+        return Array.isArray(roles) ? roles.length : 0;
+    }, [json]);
+
+    const activitiesCount = useMemo(() => {
+        const steps = Array.isArray(json?.steps) ? json.steps : [];
+        return steps.filter((step) => {
+            const type = step?.type;
+            return type === "task" || type === "subprocess" || type === "subProcess";
+        }).length;
+    }, [json]);
+
+    const gatewaysCount = useMemo(() => {
+        const steps = Array.isArray(json?.steps) ? json.steps : [];
+        return steps.filter((step) => String(step?.type || "").toLowerCase().includes("gateway")).length;
+    }, [json]);
+
+    const allocationRows = useMemo(() => {
+        const rows = [];
+        const seen = new Set();
+        const lines = text.split(/\r?\n/);
+
+        const normalize = (value) => String(value || "")
+            .toLowerCase()
+            .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const findSource = (phrase) => {
+            const needle = normalize(phrase);
+            if (!needle) return "Analyseergebnis";
+            const idx = lines.findIndex((line) => normalize(line).includes(needle));
+            return idx >= 0 ? `Zeile ${idx + 1} im Textfeld` : "Analyseergebnis";
+        };
+
+        const addRow = (wordOrPhrase, bpmnElement) => {
+            const term = String(wordOrPhrase || "").trim();
+            if (!term) return;
+            const key = `${term.toLowerCase()}|${bpmnElement}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            let rowType = "event";
+            if (bpmnElement === "Rolle/Lane") rowType = "role";
+            if (bpmnElement === "Aktivität") rowType = "activity";
+            if (bpmnElement === "Gateway") rowType = "gateway";
+            if (bpmnElement === "Ressource") rowType = "resource";
+            rows.push({
+                term,
+                bpmnElement,
+                source: findSource(term),
+                rowType
+            });
+        };
+
+        const roles = Array.isArray(json?.roles) ? json.roles : [];
+        roles.forEach((role) => addRow(role, "Rolle/Lane"));
+
+        const steps = Array.isArray(json?.steps) ? json.steps : [];
+        const resourceTerms = new Set();
+        steps.forEach((step) => {
+            const type = String(step?.type || "").toLowerCase();
+            const label = step?.label || step?.id;
+            if (!label) return;
+
+            if (type.includes("gateway")) {
+                addRow(label, "Gateway");
+            } else if (type.includes("end") || type.includes("start") || type.includes("event")) {
+                addRow(label, "Ereignis");
+            } else {
+                addRow(label, "Aktivität");
+            }
+
+            tokenizeWords(label).forEach((token) => {
+                const normalized = normalizeWord(token);
+                if (!normalized || normalized.length < 3 || GERMAN_STOPWORDS.has(normalized)) return;
+                const isLikelyNoun = token[0] === token[0]?.toUpperCase();
+                if (isLikelyNoun) resourceTerms.add(token);
+            });
+        });
+
+        resourceTerms.forEach((term) => addRow(term, "Ressource"));
+
+        return rows;
+    }, [json, text]);
+
+    const highlightedTextHtml = useMemo(() => {
+        const safeText = text || "";
+        if (!safeText) return "<br />";
+
+        const typeClassByTerm = new Map();
+        const rowTypePriority = {
+            role: 4,
+            gateway: 3,
+            resource: 2,
+            activity: 1,
+            event: 0
+        };
+        allocationRows.forEach((row) => {
+            const normalizedTerm = row.term.toLowerCase();
+            const currentType = typeClassByTerm.get(normalizedTerm);
+            const nextPriority = rowTypePriority[row.rowType] ?? 0;
+            const currentPriority = rowTypePriority[currentType] ?? -1;
+            if (!currentType || nextPriority >= currentPriority) {
+                typeClassByTerm.set(normalizedTerm, row.rowType);
+            }
+        });
+
+        const steps = Array.isArray(json?.steps) ? json.steps : [];
+        const toTokens = (input) => tokenizeWords(input)
+            .map((token) => normalizeWord(token))
+            .filter((token) => token.length >= 3)
+            .filter((token) => !GERMAN_STOPWORDS.has(token));
+
+        const addTerm = (term, rowType) => {
+            const normalized = String(term || "").toLowerCase().trim();
+            if (!normalized || normalized.length < 3) return;
+            if (!typeClassByTerm.has(normalized)) {
+                typeClassByTerm.set(normalized, rowType);
+            }
+        };
+
+        const addTermWithStemVariants = (term, rowType) => {
+            buildVerbVariants(term).forEach((variant) => addTerm(variant, rowType));
+        };
+
+        steps.forEach((step) => {
+            const type = String(step?.type || "").toLowerCase();
+            const label = step?.label || "";
+            const tokens = toTokens(label);
+
+            if (type.includes("gateway")) {
+                tokens.forEach((token) => addTermWithStemVariants(token, "gateway"));
+                addTerm("wenn", "gateway");
+                addTerm("falls", "gateway");
+                addTerm("sonst", "gateway");
+                addTerm("entscheidung", "gateway");
+            } else {
+                tokens.forEach((token) => addTermWithStemVariants(token, "activity"));
+            }
+        });
+
+        const terms = Array.from(typeClassByTerm.keys())
+            .filter((term) => term.length > 1)
+            .sort((a, b) => b.length - a.length);
+
+        if (terms.length === 0) {
+            return escapeHtml(safeText).replace(/\n/g, "<br />");
+        }
+
+        const regex = new RegExp(terms.map(escapeRegExp).join("|"), "giu");
+        const isTokenChar = (char) => /[\p{L}\p{N}-]/u.test(char || "");
+        let result = "";
+        let lastIndex = 0;
+        let match;
+
+        while ((match = regex.exec(safeText)) !== null) {
+            const start = match.index;
+            const end = start + match[0].length;
+            const beforeChar = start > 0 ? safeText[start - 1] : "";
+            const afterChar = end < safeText.length ? safeText[end] : "";
+
+            // Guard against false positives: highlight only whole token matches.
+            if (isTokenChar(beforeChar) || isTokenChar(afterChar)) {
+                continue;
+            }
+
+            result += escapeHtml(safeText.slice(lastIndex, start));
+            const rowType = typeClassByTerm.get(match[0].toLowerCase()) || "event";
+            result += `<span class="hl-${rowType}">${escapeHtml(match[0])}</span>`;
+            lastIndex = end;
+        }
+
+        result += escapeHtml(safeText.slice(lastIndex));
+        return result.replace(/\n/g, "<br />");
+    }, [text, allocationRows, json?.steps]);
+
+    const syncEditorScroll = (event) => {
+        const top = event.target.scrollTop;
+        const left = event.target.scrollLeft;
+        if (highlightRef.current) {
+            highlightRef.current.scrollTop = top;
+            highlightRef.current.scrollLeft = left;
+        }
+        if (lineNumbersRef.current) {
+            lineNumbersRef.current.scrollTop = top;
+        }
+    };
+
+    const visibleAllocationRows = useMemo(() => {
+        const needle = allocationSearch.trim().toLowerCase();
+        const filtered = allocationRows.filter((row) => {
+            const elementMatch = allocationElementFilter === "all" || row.bpmnElement === allocationElementFilter;
+            const searchMatch = !needle
+                || row.term.toLowerCase().includes(needle)
+                || row.bpmnElement.toLowerCase().includes(needle)
+                || row.source.toLowerCase().includes(needle);
+            return elementMatch && searchMatch;
+        });
+
+        const sourceRank = (source) => {
+            const match = String(source).match(/Zeile\s+(\d+)/i);
+            return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+        };
+
+        return [...filtered].sort((a, b) => {
+            if (allocationSortBy === "term") {
+                return a.term.localeCompare(b.term, "de");
+            }
+            if (allocationSortBy === "element") {
+                return a.bpmnElement.localeCompare(b.bpmnElement, "de");
+            }
+            return sourceRank(a.source) - sourceRank(b.source) || a.term.localeCompare(b.term, "de");
+        });
+    }, [allocationRows, allocationSearch, allocationElementFilter, allocationSortBy]);
+
     return (
         <div className="app-shell">
-            <h1>ProBPM</h1>
+            <img className="app-logo" src={appLogo} alt="ProBPM Draft" />
+            <div className="intro-text">
+                <p className="intro-title"><strong>Willkommen bei ProBPM.</strong></p>
+                <p>
+                    Nutzen Sie unseren ProBPM Draft, um aus Prozessbeschreibungen in Sekunden BPMN-Prozessmodelle
+                    zu generieren. Gehen Sie dazu wie folgt vor:
+                </p>
+                <ol>
+                    <li>Text eingeben bzw. Dokument hochladen.</li>
+                    <li>Klicken Sie auf "Prozessmodell generieren".</li>
+                    <li>Passen Sie das Prozessmodell im Editor an, wenn nötig.</li>
+                    <li>Exportieren Sie das Prozessmodell mit Klick auf den Download-Button (unterhalb des Editors) im gewünschten Dateiformat.</li>
+                </ol>
+            </div>
             <p className="status-line">{status}</p>
 
-            <textarea
-                rows={6}
-                className="input-textarea"
-                placeholder="Beschreibe deinen Prozess..."
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-            />
-            <div className="controls-row">
-            <button className="analyze-button" onClick={handleAnalyze} disabled={isLoading}>
-                {isLoading ? "Analysiere..." : "Prozess analysieren"}
-            </button>
+            <div
+                className={`text-editor ${isDragOverEditor ? "drag-over" : ""}`}
+                onDragOver={handleEditorDragOver}
+                onDragLeave={handleEditorDragLeave}
+                onDrop={handleEditorDrop}
+            >
+                <div className="line-numbers" aria-hidden="true">
+                    <div ref={lineNumbersRef} className="line-numbers-inner">
+                    {Array.from({ length: textLineCount }, (_, index) => (
+                        <div key={`line-${index + 1}`}>{index + 1}</div>
+                    ))}
+                    </div>
+                </div>
+                <div className="text-editor-main">
+                    {!text ? (
+                        <div className="drop-hint" aria-hidden="true">
+                            Datei hierher ziehen oder Dokument hochladen
+                            <br />
+                            <br />
+                            Oder beschreiben Sie hier den Prozess textuell.
+                        </div>
+                    ) : null}
+                    <pre
+                        ref={highlightRef}
+                        className="input-highlight"
+                        aria-hidden="true"
+                        dangerouslySetInnerHTML={{ __html: highlightedTextHtml }}
+                    />
+                    <textarea
+                        ref={textAreaRef}
+                        rows={6}
+                        className="input-textarea"
+                        placeholder=""
+                        value={text}
+                        onChange={(e) => setText(e.target.value)}
+                        onScroll={syncEditorScroll}
+                    />
+                </div>
             </div>
+            <div className="controls-row">
+                <button
+                    type="button"
+                    className="upload-button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isExtractingDocument}
+                >
+                    {isExtractingDocument ? "Dokument wird gelesen..." : "Dokument hochladen"}
+                </button>
+                <button className="analyze-button" onClick={handleAnalyze} disabled={isLoading}>
+                    {isLoading ? "Analysiere..." : "Prozessmodell generieren"}
+                </button>
+            </div>
+            <input
+                ref={fileInputRef}
+                type="file"
+                className="hidden-file-input"
+                accept=".pdf,.docx,.txt,.md,.csv,.json"
+                onChange={handleUploadDocument}
+            />
             {error ? (
                 <div className="error-box">
                     {error}
                 </div>
             ) : null}
 
-            <h2>BPMN-Editor</h2>
+            <h2 className="editor-heading">BPMN-Editor</h2>
             <div ref={paletteHostRef} className="palette-host" />
             <div ref={containerRef} className="viewer-panel" />
 
-            <h2>JSON</h2>
-            <pre className="json-panel">
-                {JSON.stringify(json, null, 2)}
-            </pre>
+            <div className="post-editor-info">
+                {showDownloadOptions ? (
+                    <div className="export-inline">
+                        <div className="export-row">
+                            <button className="download-button" onClick={handleDownloadBpmn} disabled={isExporting}>
+                                Download als BPMN-Datei
+                            </button>
+                        </div>
+                        <div className="export-row">
+                            <button className="download-button" onClick={handleDownloadPdf} disabled={isExporting}>
+                                Download als PDF-Datei
+                            </button>
+                        </div>
+                        <div className="export-row">
+                            <button className="download-button" onClick={handleDownloadSvg} disabled={isExporting}>
+                                Download als Bild-Datei
+                            </button>
+                        </div>
+                    </div>
+                ) : (
+                    <div />
+                )}
+
+                <div className="analysis-stats editor-stats">
+                    <div>Anzahl aller Worte: <strong>{totalWordCount}</strong></div>
+                    <div>Davon Anzahl prozessrelevanter Worte: <strong>{processWordCount}</strong></div>
+                    <div>Anzahl identifizierter Rollen: <strong>{rolesCount}</strong></div>
+                    <div>Anzahl identifizierter Aktivitäten: <strong>{activitiesCount}</strong></div>
+                    <div>Anzahl identifizierter Gateways: <strong>{gatewaysCount}</strong></div>
+                </div>
+            </div>
+
+            <div className="allocation-list">
+                <h2>Allokationsliste</h2>
+                <div className="allocation-controls">
+                    <input
+                        type="text"
+                        className="allocation-input"
+                        placeholder="Suche nach Wort, Element oder Quelle..."
+                        value={allocationSearch}
+                        onChange={(e) => setAllocationSearch(e.target.value)}
+                    />
+                    <select
+                        className="allocation-select"
+                        value={allocationElementFilter}
+                        onChange={(e) => setAllocationElementFilter(e.target.value)}
+                    >
+                        <option value="all">Alle Elemente</option>
+                        <option value="Rolle/Lane">Rolle/Lane</option>
+                        <option value="Aktivität">Aktivität</option>
+                        <option value="Gateway">Gateway</option>
+                        <option value="Ressource">Ressource</option>
+                        <option value="Ereignis">Ereignis</option>
+                    </select>
+                    <select
+                        className="allocation-select"
+                        value={allocationSortBy}
+                        onChange={(e) => setAllocationSortBy(e.target.value)}
+                    >
+                        <option value="source">Sortierung: Quelle</option>
+                        <option value="term">Sortierung: Wort</option>
+                        <option value="element">Sortierung: BPMN-Element</option>
+                    </select>
+                    <button
+                        type="button"
+                        className="allocation-reset"
+                        onClick={() => {
+                            setAllocationSearch("");
+                            setAllocationElementFilter("all");
+                            setAllocationSortBy("source");
+                        }}
+                    >
+                        Filter zurücksetzen
+                    </button>
+                </div>
+                <table className="allocation-table">
+                    <thead>
+                        <tr>
+                            <th>Prozessrelevantes Wort</th>
+                            <th>BPMN-Element</th>
+                            <th>Quelle</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {visibleAllocationRows.length > 0 ? (
+                            visibleAllocationRows.map((row) => (
+                                <tr key={`${row.term}-${row.bpmnElement}-${row.source}`} className={`allocation-row-${row.rowType}`}>
+                                    <td>{row.term}</td>
+                                    <td>{row.bpmnElement}</td>
+                                    <td>{row.source}</td>
+                                </tr>
+                            ))
+                        ) : (
+                            <tr>
+                                <td colSpan={3}>Noch keine Allokationen vorhanden. Bitte zuerst ein Prozessmodell generieren.</td>
+                            </tr>
+                        )}
+                    </tbody>
+                </table>
+            </div>
         </div>
     );
 }

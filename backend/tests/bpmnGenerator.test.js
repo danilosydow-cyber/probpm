@@ -68,7 +68,7 @@ test("generateBPMN returns valid core XML sections", () => {
     assert.ok(xml.includes("</bpmn:definitions>"));
 });
 
-test("generateBPMN maps taskKind serviceTask userTask boundary timer and annotations", () => {
+test("generateBPMN renders all activities as standard tasks plus timer and annotations", () => {
     const process = {
         roles: ["Einkauf", "GF"],
         annotations: [{ id: "ann_freigabe", text: "Freigabe pruefen", attachTo: "step_2" }],
@@ -102,8 +102,10 @@ test("generateBPMN maps taskKind serviceTask userTask boundary timer and annotat
 
     const xml = generateBPMN(process);
 
-    assert.ok(/<bpmn:userTask id="step_1"/.test(xml));
-    assert.ok(/<bpmn:serviceTask id="step_2"/.test(xml));
+    assert.ok(/<bpmn:task id="step_1"/.test(xml));
+    assert.ok(/<bpmn:task id="step_2"/.test(xml));
+    assert.ok(!/<bpmn:userTask id="step_1"/.test(xml));
+    assert.ok(!/<bpmn:serviceTask id="step_2"/.test(xml));
     assert.ok(xml.includes("probpm:email"));
     assert.ok(xml.includes('recipient="kunde@example.com"'));
     assert.ok(xml.includes("<bpmn:documentation>Absage mit Vorlage</bpmn:documentation>"));

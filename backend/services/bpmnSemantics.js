@@ -48,23 +48,13 @@ export function buildEmailExtensionXml(email) {
     return `<bpmn:extensionElements><probpm:email xmlns:probpm="${PROBPM_EMAIL_NS}" recipient="${recipient}" cc="${cc}" bcc="${bcc}" from="${from}" subject="${subject}" template="${template}" body="${body}" noBcsStyling="${noStyling}" /></bpmn:extensionElements>`;
 }
 
-const KIND_TO_BPMN_TAG = {
-    task: "task",
-    userTask: "userTask",
-    serviceTask: "serviceTask",
-    manualTask: "manualTask",
-    scriptTask: "scriptTask",
-    sendTask: "sendTask",
-    receiveTask: "receiveTask",
-    businessRuleTask: "businessRuleTask"
-};
-
 /**
  * Serializes one activity (task / userTask / serviceTask / …) including optional documentation and e-mail extension.
  */
 export function buildActivityElementXml(step, escapedName) {
-    const kind = sanitizeTaskKind(step.taskKind);
-    const tag = KIND_TO_BPMN_TAG[kind] || "task";
+    // Always render activities as neutral BPMN tasks (no task-type icon).
+    // taskKind can still be present in JSON for analysis purposes, but it is ignored in XML output.
+    const tag = "task";
 
     const docRaw = step.documentation;
     const docXml =
