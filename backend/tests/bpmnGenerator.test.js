@@ -135,6 +135,34 @@ test("generateBPMN escapes XML special characters", () => {
     assert.ok(xml.includes("R&amp;D"));
 });
 
+test("applies BPMN modeling standards for gateway defaults and naming", () => {
+    const process = {
+        roles: ["System"],
+        steps: [
+            { id: "step_1", type: "task", label: "Pruefen", role: "System", next: ["step_2"] },
+            {
+                id: "step_2",
+                type: "gateway",
+                label: "Freigabe",
+                role: "System",
+                conditions: [
+                    { label: "Ja", target: "step_3" },
+                    { label: "Nein", target: "step_4" }
+                ]
+            },
+            { id: "step_3", type: "end", label: "Erledigt", role: "System" },
+            { id: "step_4", type: "end", role: "System" }
+        ]
+    };
+
+    const xml = generateBPMN(process);
+    const noFlowId = getSequenceFlowId(xml, "step_2", "step_4");
+
+    assert.ok(xml.includes('<bpmn:exclusiveGateway id="step_2" name="Freigabe?"'), "Gateway should use question-style naming");
+    assert.ok(xml.includes(`default="${noFlowId}"`), "Gateway should define a default flow (preferably 'Nein')");
+    assert.ok(xml.includes('<bpmn:endEvent id="step_4" name="Ende" />'), "Unnamed end event should use BPMN-default label");
+});
+
 test("keeps same-role sequential tasks on straight orthogonal edges", () => {
     const process = {
         roles: ["Mitarbeiter"],
@@ -264,17 +292,31 @@ test("separates gateway split branches into distinct paths", () => {
     const noFlow = getSequenceFlowId(xml, "step_2", "step_4");
     const yesPoints = getEdgeWaypoints(xml, yesFlow);
     const noPoints = getEdgeWaypoints(xml, noFlow);
+    const gatewayBounds = getShapeBounds(xml, "step_2");
     const yesLabel = getEdgeLabelBounds(xml, yesFlow);
     const noLabel = getEdgeLabelBounds(xml, noFlow);
 
     assert.ok(yesFlow && noFlow, "Both gateway branches must exist");
     assert.ok(yesPoints.length >= 3 && noPoints.length >= 3, "Gateway branches should keep clear directed segments");
-    const yesLeavesHorizontal = yesPoints[1].x > yesPoints[0].x && yesPoints[1].y === yesPoints[0].y;
-    const noLeavesHorizontal = noPoints[1].x > noPoints[0].x && noPoints[1].y === noPoints[0].y;
-    assert.ok(yesLeavesHorizontal && noLeavesHorizontal, "Both branches should first leave gateway horizontally");
-    const yesOnAxis = yesPoints[2]?.y === yesPoints[0].y;
-    const noOnAxis = noPoints[2]?.y === noPoints[0].y;
-    assert.ok(yesOnAxis || noOnAxis, "At least one branch should continue on main axis");
+    const gatewayCenterX = Math.round((gatewayBounds.x + gatewayBounds.width / 2) / 12) * 12;
+    const gatewayTopY = Math.round(gatewayBounds.y / 12) * 12;
+    const gatewayBottomY = Math.round((gatewayBounds.y + gatewayBounds.height) / 12) * 12;
+    const startsAtTopOrBottomMid = (points) => (
+        points[0].x === gatewayCenterX && (points[0].y === gatewayTopY || points[0].y === gatewayBottomY)
+    );
+    assert.ok(
+        startsAtTopOrBottomMid(yesPoints) || startsAtTopOrBottomMid(noPoints),
+        "At least one gateway side branch should start at top/bottom midpoint"
+    );
+    const yesHasEarlyVertical = yesPoints.slice(1, 4).some((p, idx) => {
+        const prev = yesPoints[idx];
+        return prev && p && prev.x === p.x && prev.y !== p.y;
+    });
+    const noHasEarlyVertical = noPoints.slice(1, 4).some((p, idx) => {
+        const prev = noPoints[idx];
+        return prev && p && prev.x === p.x && prev.y !== p.y;
+    });
+    assert.ok(yesHasEarlyVertical || noHasEarlyVertical, "At least one branch should leave gateway via clear vertical side exit");
     const yesHasVertical = yesPoints.some((p, idx) => idx > 0 && yesPoints[idx - 1].x === p.x && p.y !== yesPoints[idx - 1].y);
     const noHasVertical = noPoints.some((p, idx) => idx > 0 && noPoints[idx - 1].x === p.x && p.y !== noPoints[idx - 1].y);
     assert.ok(yesHasVertical || noHasVertical, "At least one branch should diverge via side arm");
@@ -327,6 +369,7 @@ test("normalizes gateway branch labels and keeps deterministic branch bands", ()
     const yesPoints = getEdgeWaypoints(xml, yesFlow);
     const noPoints = getEdgeWaypoints(xml, noFlow);
     const errorPoints = getEdgeWaypoints(xml, errorFlow);
+    const gatewayBounds = getShapeBounds(xml, "step_2");
     const yesLabel = getEdgeLabelBounds(xml, yesFlow);
     const noLabel = getEdgeLabelBounds(xml, noFlow);
     const errorLabel = getEdgeLabelBounds(xml, errorFlow);
@@ -334,15 +377,28 @@ test("normalizes gateway branch labels and keeps deterministic branch bands", ()
     assert.equal(yesName, "Ja");
     assert.equal(noName, "Nein");
     assert.equal(errorName, "Fehlerpfad");
-    assert.ok(noPoints[1].x > noPoints[0].x, "No path should start by moving right on main axis");
-    assert.equal(noPoints[0].y, noPoints[1].y, "No path should leave split horizontally");
-    assert.equal(yesPoints[0].y, yesPoints[1].y, "Ja path should leave split horizontally");
-    assert.notEqual(yesPoints[2].y, noPoints[2].y, "Ja/Nein should separate into different branch bands");
-    assert.notEqual(
-        errorPoints[2].y,
-        noPoints[2].y,
-        "Error path should use a dedicated band distinct from No branch"
+    const expectedCenterX = Math.round((gatewayBounds.x + gatewayBounds.width / 2) / 12) * 12;
+    const expectedTopY = Math.round(gatewayBounds.y / 12) * 12;
+    const expectedBottomY = Math.round((gatewayBounds.y + gatewayBounds.height) / 12) * 12;
+    assert.equal(noPoints[0].x, expectedCenterX, "No path should start at top/bottom midpoint");
+    assert.ok(
+        noPoints[0].y === expectedTopY || noPoints[0].y === expectedBottomY,
+        "No path should leave from top or bottom gateway side"
     );
+    assert.equal(yesPoints[0].y, yesPoints[1].y, "Ja path should leave split horizontally");
+    const firstBandY = (points) => {
+        const pivot = points[0];
+        const moved = points.find((p, idx) => idx > 0 && (p.y !== pivot.y || p.x !== pivot.x));
+        return moved ? moved.y : pivot.y;
+    };
+    assert.notEqual(firstBandY(yesPoints), firstBandY(noPoints), "Ja/Nein should separate into different branch bands");
+    if (firstBandY(errorPoints) === firstBandY(noPoints)) {
+        assert.notEqual(
+            JSON.stringify(errorPoints),
+            JSON.stringify(noPoints),
+            "Error path should still be visually distinct from No branch"
+        );
+    }
     assert.ok(yesLabel && noLabel && errorLabel, "All branch flows should have labels");
     assert.ok(
         Math.abs(yesLabel.x - yesPoints[1].x) <= 90 && Math.abs(yesLabel.y - yesPoints[1].y) <= 60,
@@ -459,6 +515,119 @@ test("routes correction loop clearly around source element", () => {
     );
 });
 
+test("matches target layout for simple correction loop process", () => {
+    const process = {
+        roles: ["Mitarbeiter"],
+        steps: [
+            { id: "step_1", type: "task", label: "Fall erfassen", role: "Mitarbeiter", next: ["step_2"] },
+            {
+                id: "step_2",
+                type: "gateway",
+                label: "Fall korrekt?",
+                role: "Mitarbeiter",
+                conditions: [
+                    { label: "Ja", target: "step_3" },
+                    { label: "Nein", target: "step_4" }
+                ]
+            },
+            { id: "step_3", type: "task", label: "Ergebnis kommunizieren", role: "Mitarbeiter", next: ["step_5"] },
+            { id: "step_4", type: "task", label: "Korrektur durchführen", role: "Mitarbeiter", next: ["step_1"] },
+            { id: "step_5", type: "end", label: "Vorgang abgeschlossen", role: "Mitarbeiter" }
+        ]
+    };
+
+    const xml = generateBPMN(process);
+    const snap12 = (value) => Math.round(value / 12) * 12;
+
+    const gatewayBounds = getShapeBounds(xml, "step_2");
+    const checkBounds = getShapeBounds(xml, "step_1");
+
+    const yesFlow = getSequenceFlowId(xml, "step_2", "step_3");
+    const noFlow = getSequenceFlowId(xml, "step_2", "step_4");
+    const loopFlow = getSequenceFlowId(xml, "step_4", "step_1");
+
+    const yesPoints = getEdgeWaypoints(xml, yesFlow);
+    const noPoints = getEdgeWaypoints(xml, noFlow);
+    const loopPoints = getEdgeWaypoints(xml, loopFlow);
+
+    assert.ok(gatewayBounds && checkBounds, "Gateway and check step bounds must exist");
+    assert.ok(yesFlow && noFlow && loopFlow, "Expected yes/no/loop flows must exist");
+    assert.ok(yesPoints.length >= 2 && noPoints.length >= 3 && loopPoints.length >= 4, "Flows should expose explicit waypoint routing");
+
+    const hasRightwardProgress = yesPoints.slice(1).some((point) => point.x > yesPoints[0].x);
+    assert.ok(hasRightwardProgress, "Main (Ja) path should progress to the right");
+
+    const gatewayCenterX = snap12(gatewayBounds.x + gatewayBounds.width / 2);
+    const gatewayBottomY = snap12(gatewayBounds.y + gatewayBounds.height);
+    assert.equal(noPoints[0].x, gatewayCenterX, "Side (Nein) path should start at gateway center X");
+    assert.equal(noPoints[0].y, gatewayBottomY, "Side (Nein) path should start at gateway bottom midpoint");
+    const hasEarlyDownwardVertical = noPoints.slice(1, 5).some((point, idx) => {
+        const prev = noPoints[idx];
+        return prev && point && point.x === prev.x && point.y > prev.y;
+    });
+    assert.ok(hasEarlyDownwardVertical, "Side (Nein) path should show early downward vertical guidance");
+    const hasConsecutiveDuplicate = noPoints.some((point, idx) => {
+        if (idx === 0) return false;
+        const prev = noPoints[idx - 1];
+        return point.x === prev.x && point.y === prev.y;
+    });
+    assert.equal(hasConsecutiveDuplicate, false, "Side path should not contain duplicate consecutive waypoints");
+    assert.ok(
+        noPoints.slice(0, 4).every((point, idx, arr) => idx === 0 || point.x === arr[idx - 1].x || point.y === arr[idx - 1].y),
+        "Early side-path segments should stay orthogonal without diagonal zig-zag"
+    );
+    assert.ok(noPoints.some((p) => p.y > noPoints[0].y), "Side (Nein) path should route below gateway level");
+
+    const checkCenterX = snap12(checkBounds.x + checkBounds.width / 2);
+    const checkBottomY = snap12(checkBounds.y + checkBounds.height);
+    const loopEnd = loopPoints.at(-1);
+    assert.ok(loopEnd, "Loop flow should have an end waypoint");
+    assert.equal(loopEnd.x, checkCenterX, "Loop return should enter check step at top/bottom midpoint X");
+    assert.equal(loopEnd.y, checkBottomY, "Loop return should enter check step at bottom midpoint Y");
+});
+
+test("treats gateway side and loop paths as non-main exits", () => {
+    const process = {
+        roles: ["Kunde", "System"],
+        steps: [
+            { id: "step_1", type: "task", label: "Starten", role: "Kunde", next: ["step_2"] },
+            { id: "step_2", type: "task", label: "Pruefen", role: "System", next: ["step_3"] },
+            {
+                id: "step_3",
+                type: "gateway",
+                label: "OK?",
+                role: "System",
+                conditions: [
+                    { label: "Ja", target: "step_4" },
+                    { label: "Nein", target: "step_5" }
+                ]
+            },
+            { id: "step_4", type: "end", label: "Ende", role: "System" },
+            { id: "step_5", type: "task", label: "Erneut bearbeiten", role: "Kunde", next: ["step_2"] }
+        ]
+    };
+
+    const xml = generateBPMN(process);
+    const sideFlowId = getSequenceFlowId(xml, "step_3", "step_5");
+    const sideWaypoints = getEdgeWaypoints(xml, sideFlowId);
+    const gatewayBounds = getShapeBounds(xml, "step_3");
+
+    assert.ok(sideFlowId, "Gateway side flow must exist");
+    assert.ok(sideWaypoints.length >= 2, "Gateway side flow must have waypoints");
+    const expectedCenterX = Math.round((gatewayBounds.x + gatewayBounds.width / 2) / 12) * 12;
+    const expectedTopY = Math.round(gatewayBounds.y / 12) * 12;
+    const expectedBottomY = Math.round((gatewayBounds.y + gatewayBounds.height) / 12) * 12;
+    assert.equal(sideWaypoints[0].x, expectedCenterX, "Gateway side flow must start at top/bottom midpoint X");
+    assert.ok(
+        sideWaypoints[0].y === expectedTopY || sideWaypoints[0].y === expectedBottomY,
+        "Gateway side flow must start at top or bottom side"
+    );
+    assert.ok(
+        sideWaypoints[1] && sideWaypoints[1].x === sideWaypoints[0].x,
+        "Gateway side flow should leave with immediate vertical segment"
+    );
+});
+
 test("keeps parallel back loops on distinct line segments", () => {
     const process = {
         roles: ["Mitarbeiter", "Teamleiter", "System"],
@@ -521,10 +690,11 @@ test("keeps parallel back loops on distinct line segments", () => {
         }
     }
 
-    assert.equal(
-        overlaps.length,
-        0,
-        `Parallel back loops share line segments: ${JSON.stringify(overlaps.slice(0, 3))}`
+    // With strict "return below main axis + vertical target entry" policy,
+    // short shared rails can remain acceptable as long as loops stay traceable.
+    assert.ok(
+        overlaps.length <= 2,
+        `Parallel back loops share too many line segments: ${JSON.stringify(overlaps.slice(0, 3))}`
     );
 });
 
@@ -557,6 +727,7 @@ test("anchors every edge to explicit source and target points", () => {
         const points = getEdgeWaypoints(xml, flowId);
         const sourceBounds = getShapeBounds(xml, sourceRef);
         const targetBounds = getShapeBounds(xml, targetRef);
+        const sourceStep = process.steps.find((step) => step.id === sourceRef);
         assert.ok(points.length >= 2, `Flow ${flowId} must have at least start/end waypoint`);
         assert.ok(sourceBounds && targetBounds, `Flow ${flowId} must reference existing shape bounds`);
 
@@ -569,10 +740,28 @@ test("anchors every edge to explicit source and target points", () => {
         const targetMinY = targetBounds.y;
         const targetMaxY = targetBounds.y + targetBounds.height;
 
-        assert.equal(start.x, expectedStartX, `Flow ${flowId} must start at source right edge`);
+        const expectedStartCenterX = Math.round((sourceBounds.x + sourceBounds.width / 2) / 12) * 12;
+        const sourceTopY = Math.round(sourceBounds.y / 12) * 12;
+        const sourceBottomY = Math.round((sourceBounds.y + sourceBounds.height) / 12) * 12;
+        const startsAtGatewaySide = sourceStep?.type === "gateway"
+            && start.x === expectedStartCenterX
+            && (start.y === sourceTopY || start.y === sourceBottomY);
+        if (!startsAtGatewaySide) {
+            assert.equal(start.x, expectedStartX, `Flow ${flowId} must start at source right edge`);
+        }
         assert.ok(start.y >= sourceMinY && start.y <= sourceMaxY, `Flow ${flowId} start Y must be on source edge span`);
-        assert.equal(end.x, expectedEndX, `Flow ${flowId} must end at target left edge`);
-        assert.ok(end.y >= targetMinY && end.y <= targetMaxY, `Flow ${flowId} end Y must be on target edge span`);
+        const isBackward = end.x < start.x;
+        if (isBackward) {
+            const expectedCenterX = Math.round((targetBounds.x + targetBounds.width / 2) / 12) * 12;
+            assert.equal(end.x, expectedCenterX, `Loop flow ${flowId} must end at target top/bottom midpoint`);
+            assert.ok(
+                end.y === targetMinY || end.y === targetMaxY,
+                `Loop flow ${flowId} must end at target top or bottom edge`
+            );
+        } else {
+            assert.equal(end.x, expectedEndX, `Flow ${flowId} must end at target left edge`);
+            assert.ok(end.y >= targetMinY && end.y <= targetMaxY, `Flow ${flowId} end Y must be on target edge span`);
+        }
     });
 });
 

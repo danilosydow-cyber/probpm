@@ -40,6 +40,15 @@ function normalizeBranchLabel(label, fallback = "Bedingung") {
     return compactLabel(raw || fallback, 2);
 }
 
+function normalizeGatewayDisplayName(label) {
+    const compact = compactLabel(label || "Entscheidung", 4) || "Entscheidung";
+    if (compact.endsWith("?")) return compact;
+    if (/(^|\b)(entscheidung|pruefen|prüfen|ok|gueltig|gültig|vollstaendig|vollständig|genehmigt|freigabe)(\b|$)/i.test(compact)) {
+        return `${compact}?`;
+    }
+    return compact;
+}
+
 function rectsOverlap(a, b) {
     return (
         a.x < b.x + b.width
@@ -49,13 +58,13 @@ function rectsOverlap(a, b) {
     );
 }
 
-function placeEdgeLabelBounds(anchor, labelWidth, labelHeight, stepRects) {
+function placeEdgeLabelBounds(anchor, labelWidth, labelHeight, stepRects, yBias = 0) {
     const candidates = [
-        { x: snap(anchor.x + 6), y: snap(anchor.y - 14) },
-        { x: snap(anchor.x + 6), y: snap(anchor.y + 6) },
-        { x: snap(anchor.x - labelWidth - 8), y: snap(anchor.y - 14) },
-        { x: snap(anchor.x - labelWidth - 8), y: snap(anchor.y + 6) },
-        { x: snap(anchor.x + 6), y: snap(anchor.y - 32) }
+        { x: snap(anchor.x + 6), y: snap(anchor.y - 14 + yBias) },
+        { x: snap(anchor.x + 6), y: snap(anchor.y + 6 + yBias) },
+        { x: snap(anchor.x - labelWidth - 8), y: snap(anchor.y - 14 + yBias) },
+        { x: snap(anchor.x - labelWidth - 8), y: snap(anchor.y + 6 + yBias) },
+        { x: snap(anchor.x + 6), y: snap(anchor.y - 32 + yBias) }
     ];
 
     for (const candidate of candidates) {
@@ -66,25 +75,34 @@ function placeEdgeLabelBounds(anchor, labelWidth, labelHeight, stepRects) {
 
     return {
         x: snap(anchor.x + 6),
-        y: snap(anchor.y - 32),
+        y: snap(anchor.y - 32 + yBias),
         width: labelWidth,
         height: labelHeight
     };
 }
 
 function compactOrthogonalWaypoints(points) {
-    if (!Array.isArray(points) || points.length < 3) return points;
-    const out = [points[0]];
-    for (let i = 1; i < points.length - 1; i += 1) {
+    if (!Array.isArray(points) || points.length < 2) return points;
+    const deduped = [points[0]];
+    for (let i = 1; i < points.length; i += 1) {
+        const prev = deduped[deduped.length - 1];
+        const curr = points[i];
+        if (!curr) continue;
+        if (prev.x === curr.x && prev.y === curr.y) continue;
+        deduped.push(curr);
+    }
+    if (deduped.length < 3) return deduped;
+    const out = [deduped[0]];
+    for (let i = 1; i < deduped.length - 1; i += 1) {
         const a = out[out.length - 1];
-        const b = points[i];
-        const c = points[i + 1];
+        const b = deduped[i];
+        const c = deduped[i + 1];
         const colinearVertical = a.x === b.x && b.x === c.x;
         const colinearHorizontal = a.y === b.y && b.y === c.y;
         if (colinearVertical || colinearHorizontal) continue;
         out.push(b);
     }
-    out.push(points[points.length - 1]);
+    out.push(deduped[deduped.length - 1]);
     return out;
 }
 
@@ -116,12 +134,191 @@ function getNodeSize(step) {
     };
 }
 
+function resolveLaneNodeOverlaps(steps, positions, laneMeta, lanePadding = 16) {
+    const byRole = new Map();
+    steps.forEach((step) => {
+        if (!positions[step.id]) return;
+        const list = byRole.get(step._roleId) || [];
+        list.push(step);
+        byRole.set(step._roleId, list);
+    });
+
+    const overlaps = (a, b, margin = 12) => (
+        a.x < (b.x + b.w + margin)
+        && (a.x + a.w + margin) > b.x
+        && a.y < (b.y + b.h + margin)
+        && (a.y + a.h + margin) > b.y
+    );
+
+    byRole.forEach((laneSteps, roleId) => {
+        const lane = laneMeta[roleId];
+        if (!lane) return;
+
+        const placed = laneSteps.map((step) => ({
+            step,
+            pos: positions[step.id],
+            size: getNodeSize(step)
+        }));
+
+        for (let pass = 0; pass < 8; pass += 1) {
+            let changed = false;
+            for (let i = 0; i < placed.length; i += 1) {
+                for (let j = i + 1; j < placed.length; j += 1) {
+                    const a = placed[i];
+                    const b = placed[j];
+                    const ar = { x: a.pos.x, y: a.pos.y, w: a.size.width, h: a.size.height };
+                    const br = { x: b.pos.x, y: b.pos.y, w: b.size.width, h: b.size.height };
+                    if (!overlaps(ar, br)) continue;
+
+                    const laneMinY = lane.y + lanePadding;
+                    const laneMaxA = lane.y + lane.height - lanePadding - a.size.height;
+                    const laneMaxB = lane.y + lane.height - lanePadding - b.size.height;
+                    const moveDown = Math.max(18, (ar.y + ar.h + 14) - br.y);
+
+                    const aMain = Boolean(a.step._isMain);
+                    const bMain = Boolean(b.step._isMain);
+                    if (aMain || bMain) continue;
+
+                    if (b.pos.y + moveDown <= laneMaxB) {
+                        b.pos.y = snap(b.pos.y + moveDown);
+                        changed = true;
+                    } else if (a.pos.y - moveDown >= laneMinY) {
+                        a.pos.y = snap(a.pos.y - moveDown);
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+    });
+}
+
+function compactLaneHorizontalGaps(steps, positions, flows, laneMeta) {
+    const stepsById = new Map((steps || []).map((step) => [step.id, step]));
+    const inCount = new Map();
+    const outCount = new Map();
+    const crossRoleIncident = new Map();
+    flows.forEach((flow) => {
+        outCount.set(flow.from, (outCount.get(flow.from) || 0) + 1);
+        inCount.set(flow.to, (inCount.get(flow.to) || 0) + 1);
+        const fromStep = stepsById.get(flow.from);
+        const toStep = stepsById.get(flow.to);
+        if (fromStep?._roleId && toStep?._roleId && fromStep._roleId !== toStep._roleId) {
+            crossRoleIncident.set(flow.from, (crossRoleIncident.get(flow.from) || 0) + 1);
+            crossRoleIncident.set(flow.to, (crossRoleIncident.get(flow.to) || 0) + 1);
+        }
+    });
+
+    const byRole = new Map();
+    steps.forEach((step) => {
+        const pos = positions[step.id];
+        if (!pos) return;
+        const roleId = step._roleId || "_default";
+        const list = byRole.get(roleId) || [];
+        list.push(step);
+        byRole.set(roleId, list);
+    });
+
+    const isComplex = (step) => {
+        const t = String(step?.type || "");
+        if (t === "gateway" || t === "startEvent" || t === "endEvent" || t === "boundaryTimer") return true;
+        if ((inCount.get(step.id) || 0) > 1) return true;
+        if ((outCount.get(step.id) || 0) > 1) return true;
+        if ((crossRoleIncident.get(step.id) || 0) > 0) return true;
+        return false;
+    };
+
+    byRole.forEach((laneSteps, roleId) => {
+        if (!laneMeta[roleId]) return;
+        const sorted = [...laneSteps].sort((a, b) => {
+            const ax = positions[a.id]?.x || 0;
+            const bx = positions[b.id]?.x || 0;
+            return ax - bx;
+        });
+
+        for (let i = 1; i < sorted.length; i += 1) {
+            const prev = sorted[i - 1];
+            const curr = sorted[i];
+            const prevPos = positions[prev.id];
+            const currPos = positions[curr.id];
+            if (!prevPos || !currPos) continue;
+            if (isComplex(prev) || isComplex(curr)) continue;
+
+            const prevSize = getNodeSize(prev);
+            const currSize = getNodeSize(curr);
+            const edgeGap = currPos.x - (prevPos.x + prevSize.width);
+            const nearSameRow = Math.abs((prevPos.y + prevSize.height / 2) - (currPos.y + currSize.height / 2)) <= 36;
+            if (!nearSameRow) continue;
+
+            // Only reduce excessive whitespace; keep safety distance for readability.
+            const targetGap = 96;
+            if (edgeGap <= targetGap + 24) continue;
+
+            const maxShift = 48;
+            const shift = Math.min(maxShift, edgeGap - targetGap);
+            currPos.x = snap(currPos.x - shift);
+        }
+    });
+}
+
 const SHAPE_LABEL_GAP = 10;
 const SHAPE_LABEL_HEIGHT = 18;
 const LANE_X = 50;
 const LANE_SIDE_PADDING = 64;
+const ROUTING_POLICY = Object.freeze({
+    PROTECT_GATEWAY_SIDE_EXIT_SEGMENTS: 2,
+    PROTECT_MAIN_SOURCE_SEGMENTS: 1,
+    PROTECT_LOOP_TARGET_SEGMENTS: 2
+});
 
-function buildOutgoingIndex(flows, positions = null, stepsById = null) {
+function classifyFlowRoutingClass(flow, sourceStep) {
+    if (flow?._isBackEdge) return "loop";
+    if (sourceStep?.type === "gateway" && !flow?._isMain) return "gateway-side";
+    if (flow?._isMain) return "main";
+    return "other";
+}
+
+function computeLongestPathToEnd(steps, flows) {
+    const bySource = new Map();
+    flows.forEach((flow) => {
+        const list = bySource.get(flow.from) || [];
+        list.push(flow.to);
+        bySource.set(flow.from, list);
+    });
+
+    const stepById = new Map((steps || []).map((step) => [step.id, step]));
+    const memo = new Map();
+
+    const dfs = (stepId, visiting = new Set()) => {
+        if (memo.has(stepId)) return memo.get(stepId);
+        const step = stepById.get(stepId);
+        if (!step) return 0;
+        if (step.type === "end" || step.type === "endEvent") {
+            memo.set(stepId, 0);
+            return 0;
+        }
+        if (visiting.has(stepId)) {
+            // Cycle guard: treat cycle edge as short continuation.
+            return 1;
+        }
+        visiting.add(stepId);
+        const nextTargets = bySource.get(stepId) || [];
+        let best = 0;
+        nextTargets.forEach((targetId) => {
+            best = Math.max(best, 1 + dfs(targetId, visiting));
+        });
+        visiting.delete(stepId);
+        memo.set(stepId, best);
+        return best;
+    };
+
+    steps.forEach((step) => {
+        dfs(step.id, new Set());
+    });
+    return memo;
+}
+
+function buildOutgoingIndex(flows, positions = null, stepsById = null, longestPathToEnd = null) {
     const bySource = new Map();
     const indexByFlowId = new Map();
     flows.forEach((flow, index) => {
@@ -147,14 +344,24 @@ function buildOutgoingIndex(flows, positions = null, stepsById = null) {
 
                 const startX = from.x + fromSize.width;
                 const startY = from.y + fromSize.height / 2;
-                const score = (to, size) => {
+                const sourceStep = stepsById.get(a.from);
+                const score = (candidate, to, size, targetId) => {
                     const targetX = to.x;
                     const targetY = to.y + size.height / 2;
                     const forwardPenalty = targetX >= startX ? 0 : 10000;
                     const verticalPenalty = Math.abs(targetY - startY);
-                    return forwardPenalty + verticalPenalty;
+                    const loopPenalty = candidate?._isBackEdge ? 12000 : 0;
+                    // Hard rule: branches that lead to loops are never main exits.
+                    const loopLeadPenalty = candidate?._leadsToLoop ? 50000 : 0;
+                    const routePenalty = forwardPenalty + verticalPenalty + loopPenalty + loopLeadPenalty;
+                    if (sourceStep?.type === "gateway" && longestPathToEnd) {
+                        const remaining = Number(longestPathToEnd.get(targetId) || 0);
+                        // Prefer the longest branch as the main-axis branch.
+                        return routePenalty - remaining * 1000;
+                    }
+                    return routePenalty;
                 };
-                return score(toA, toASize) - score(toB, toBSize);
+                return score(a, toA, toASize, a.to) - score(b, toB, toBSize, b.to);
             });
         }
 
@@ -170,17 +377,39 @@ function buildOutgoingIndex(flows, positions = null, stepsById = null) {
     return indexByFlowId;
 }
 
+function isGatewayMainExitFlow(fromStep, flow, outgoingMeta) {
+    return Boolean(
+        fromStep?.type === "gateway"
+        && (flow?._isMain || outgoingMeta?.isPrimary)
+        && !flow?._isBackEdge
+        && !flow?._leadsToLoop
+    );
+}
+
+function shouldPreferYesAsMainExit(fromStep, flow, allFlows) {
+    if (fromStep?.type !== "gateway") return false;
+    if (!flow || flow._isBackEdge) return false;
+    if (classifyBranchLabel(flow.condition) !== "yes") return false;
+    const siblings = (allFlows || []).filter((candidate) => candidate.from === flow.from && candidate !== flow);
+    return siblings.some((candidate) => {
+        const kind = classifyBranchLabel(candidate.condition);
+        return kind === "no" || kind === "error";
+    });
+}
+
 function routeFlow(
     flow,
     index,
     stepsById,
     positions,
+    allFlows,
     outgoingIndexMeta,
     _horizontalBands,
     _loopBands,
     corridorState,
     laneBounds,
-    laneMeta
+    laneMeta,
+    strictQuality = false
 ) {
     const from = positions[flow.from];
     const to = positions[flow.to];
@@ -202,10 +431,21 @@ function routeFlow(
 
     const sameRole = fromStep?._roleId && toStep?._roleId && fromStep._roleId === toStep._roleId;
     const isDecisionSplit = fromStep?.type === "gateway" || outgoingMeta.total > 1;
-    const isLoop = endX <= startX;
-    const isPrimaryForward = Boolean(outgoingMeta.isPrimary) && endX > startX;
+    const isLoop = Boolean(flow._isBackEdge);
+    const branchKind = classifyBranchLabel(flow.condition);
+    const preferYesAsMain = shouldPreferYesAsMainExit(fromStep, flow, allFlows);
+    const isGatewayAffirmativeForward = fromStep?.type === "gateway"
+        && branchKind === "yes"
+        && endX > startX
+        && !isLoop;
+    const isGatewayPrimaryForward = (isGatewayMainExitFlow(fromStep, flow, outgoingMeta) || preferYesAsMain || isGatewayAffirmativeForward)
+        && endX > startX;
+    const isPrimaryForward = fromStep?.type === "gateway"
+        ? isGatewayPrimaryForward
+        : Boolean(outgoingMeta.isPrimary) && endX > startX;
     const isMainFlow = Boolean(flow._isMain);
     const isDirectJoinToGateway = fromStep?.type !== "gateway" && toStep?.type === "gateway" && !isLoop;
+    const isToEndEvent = toStep?.type === "endEvent" && !isLoop;
 
     // Dominant forward line: if next element is directly on the right in the same row,
     // keep the connector perfectly straight for readability (even if side branches exist).
@@ -227,6 +467,22 @@ function routeFlow(
         return [
             { x: snap(startX), y: snap(startY) },
             { x: snap(endX), y: snap(startY) },
+            { x: snap(endX), y: snap(endY) }
+        ];
+    }
+
+    if (isToEndEvent) {
+        if (Math.abs(snap(startY) - snap(endY)) <= SNAP_GRID) {
+            return [
+                { x: snap(startX), y: snap(startY) },
+                { x: snap(endX), y: snap(endY) }
+            ];
+        }
+        const entryX = snap(endX - 18);
+        return [
+            { x: snap(startX), y: snap(startY) },
+            { x: entryX, y: snap(startY) },
+            { x: entryX, y: snap(endY) },
             { x: snap(endX), y: snap(endY) }
         ];
     }
@@ -258,7 +514,7 @@ function routeFlow(
     // Keep joins into gateways as short as possible:
     // rightward exit from source, then direct vertical move into gateway anchor.
     if (isDirectJoinToGateway) {
-        const entryX = snap(endX - 12);
+        const entryX = snap(endX - 6);
         return [
             { x: snap(startX), y: snap(startY) },
             { x: entryX, y: snap(startY) },
@@ -267,80 +523,47 @@ function routeFlow(
         ];
     }
 
-    // Loop/back edge: route explicitly around the elements through an outer corridor.
+    // Loop/back edge: keep loops compact and separated near involved lanes.
     if (isLoop) {
         const loopTrack = corridorState.loop ?? 0;
         corridorState.loop = loopTrack + 1;
-        const useUpper = loopTrack % 2 === 0;
         const level = Math.floor(loopTrack / 2) + 1;
-        const lateralOffset = loopTrack * 24;
         const fromLane = fromStep?._roleId ? laneMeta?.[fromStep._roleId] : null;
         const toLane = toStep?._roleId ? laneMeta?.[toStep._roleId] : null;
-        const sameLaneLoop = Boolean(fromStep?._roleId && toStep?._roleId && fromStep._roleId === toStep._roleId && fromLane);
-        const localMinY = Math.min(
-            fromLane?.y ?? laneBounds.minY,
-            toLane?.y ?? laneBounds.minY
-        );
+        const localMinY = Math.min(fromLane?.y ?? laneBounds.minY, toLane?.y ?? laneBounds.minY);
         const localMaxY = Math.max(
             (fromLane?.y ?? laneBounds.maxY) + (fromLane?.height ?? 0),
             (toLane?.y ?? laneBounds.maxY) + (toLane?.height ?? 0)
         );
         const localMinX = Math.min(startX, endX);
         const localMaxX = Math.max(startX, endX);
-        const laneInnerTop = fromLane ? fromLane.y + 18 : localMinY;
-        const laneInnerBottom = fromLane ? fromLane.y + fromLane.height - 18 : localMaxY;
-        const topClearance = Math.min(startY, endY) - laneInnerTop;
-        const bottomClearance = laneInnerBottom - Math.max(startY, endY);
-        const canUseInnerTop = sameLaneLoop && topClearance >= 30;
-        const canUseInnerBottom = sameLaneLoop && bottomClearance >= 30;
-        const shouldUseTopInner = canUseInnerTop && (!canUseInnerBottom || topClearance >= bottomClearance);
-        const shouldUseBottomInner = canUseInnerBottom && (!canUseInnerTop || bottomClearance > topClearance);
-        const loopYCore = shouldUseTopInner
-            ? snap(laneInnerTop + level * 8)
-            : shouldUseBottomInner
-                ? snap(laneInnerBottom - level * 8)
-                : (
-                    useUpper
-                        ? snap(localMinY - 20 - level * 16)
-                        : snap(localMaxY + 20 + level * 16)
-                );
-        const loopYParallel = outgoingMeta.total > 1
-            ? Math.round((outgoingMeta.localIndex - (outgoingMeta.total - 1) / 2) * 16)
-            : 0;
-        const loopY = snap(loopYCore + loopYParallel);
-        const rawRightRailX = snap(
-            localMaxX + 48 + level * 16 + outgoingMeta.localIndex * 8 + lateralOffset
-        );
-        const rightRailX = snap(
-            Math.max(rawRightRailX, startX + 96 + loopTrack * 16) + outgoingMeta.localIndex * 36
-        );
-        const leftRailFloor = 36 + loopTrack * 24;
-        const leftRailX = snap(
-            Math.max(leftRailFloor, localMinX - 48 - level * 16 - outgoingMeta.localIndex * 8 - lateralOffset)
-        );
+        // Adaptive loop density:
+        // keep loops compact for small counts, but spread them progressively
+        // when multiple loop edges share the same area.
+        const densityPhase = loopTrack < 2 ? 0 : loopTrack < 5 ? 1 : 2;
+        const levelStep = densityPhase === 0 ? 10 : densityPhase === 1 ? 14 : 18;
+        const laneInset = densityPhase === 0 ? 24 : 18;
+        const bottomBand = snap(localMaxY - laneInset - level * levelStep);
+        const preferredUnderAxis = snap(Math.max(startY, endY) + 36 + level * levelStep);
+        const maxInsideLane = snap(localMaxY - 12);
+        const loopY = snap(Math.min(maxInsideLane, Math.max(bottomBand, preferredUnderAxis)));
+        const railSpread = densityPhase === 0 ? 14 : densityPhase === 1 ? 18 : 24;
+        const desiredRailX = Math.max(startX + 36, localMaxX + 36 + level * railSpread);
+        const maxRailX = strictQuality ? laneBounds.maxX + 48 : laneBounds.maxX + 132;
+        const rightRailX = snap(Math.min(maxRailX, desiredRailX));
         const exitX = snap(startX + 24);
-        const entryX = snap(Math.max(36, endX - 16 - lateralOffset));
-        const railLiftSpread = outgoingMeta.total > 1 ? 20 : 8;
-        const railLift = snap(
-            startY + (useUpper ? -1 : 1) * (12 + outgoingMeta.localIndex * railLiftSpread + level * 4)
-        );
-        const approachY = (shouldUseTopInner || shouldUseBottomInner)
-            ? loopY
-            : snap(
-                endY + (useUpper ? -1 : 1) * (10 + outgoingMeta.localIndex * 6 + level * 2)
-            );
+        const targetCenterX = to.x + toSize.width / 2;
+        const targetAnchorY = to.y + toSize.height;
+        const entryRailOffset = (loopTrack % 2 === 0 ? -1 : 1) * Math.max(12, level * 6);
+        const entryX = snap(targetCenterX + entryRailOffset);
 
         const loopPoints = [
             { x: snap(startX), y: snap(startY) },
             { x: exitX, y: snap(startY) },
-            { x: exitX, y: railLift },
-            { x: rightRailX, y: railLift },
+            { x: rightRailX, y: snap(startY) },
             { x: rightRailX, y: loopY },
-            { x: leftRailX, y: loopY },
-            { x: leftRailX, y: approachY },
-            { x: entryX, y: approachY },
-            { x: entryX, y: snap(endY) },
-            { x: snap(endX), y: snap(endY) }
+            { x: entryX, y: loopY },
+            { x: entryX, y: snap(targetAnchorY) }
         ];
         return loopPoints.filter((point, idx, arr) => {
             if (idx === 0) return true;
@@ -349,31 +572,64 @@ function routeFlow(
         });
     }
 
-    // Decision split: first segment leaves gateway in a clear 45-degree angle.
+    // Decision split: keep gateway exits deterministic and orthogonal.
     if (fromStep?.type === "gateway") {
         const branchKind = classifyBranchLabel(flow.condition);
         const forkKey = `fork:${flow.from}`;
         const existingFork = corridorState.gatewayForks.get(forkKey);
-        const forkX = existingFork?.x ?? snap(startX + 72);
+        const targetDeltaX = Math.max(24, endX - startX);
+        const forkX = existingFork?.x ?? snap(startX + Math.min(72, Math.max(36, Math.round(targetDeltaX * 0.28))));
         const baseY = existingFork?.y ?? snap(startY);
         corridorState.gatewayForks.set(forkKey, { x: forkX, y: baseY });
 
         const gatewayKey = `${flow.from}:${branchKind}`;
         const branchLevel = corridorState.gatewayBranchLevels.get(gatewayKey) || 0;
         corridorState.gatewayBranchLevels.set(gatewayKey, branchLevel + 1);
-        const sideDirection = outgoingMeta.localIndex % 2 === 1 ? -1 : 1;
+        const branchDirection = !isPrimaryForward
+            ? resolveGatewayBranchDirectionWithFallback(flow, allFlows, stepsById, laneMeta, from, to)
+            : 0;
+        const sideDirection = branchKind === "no" || branchKind === "error"
+            ? 1
+            : branchDirection !== 0
+                ? branchDirection
+                : (outgoingMeta.localIndex % 2 === 1 ? -1 : 1);
         const sideLevel = Math.ceil(outgoingMeta.localIndex / 2);
-        const sideOffset = (sideLevel || 1) * 96;
+
+        // Adaptive branch fan-out:
+        // more room in lane -> clearer vertical separation, less room -> compact.
+        const sourceLane = fromStep?._roleId ? laneMeta?.[fromStep._roleId] : null;
+        const laneHeight = Number(sourceLane?.height || 120);
+        const spreadBase = laneHeight >= 220 ? 88 : laneHeight >= 170 ? 76 : 64;
+        const spreadStep = laneHeight >= 220 ? 22 : laneHeight >= 170 ? 18 : 14;
+        const sideOffset = (sideLevel || 1) * spreadBase;
         const branchCorridorY = isPrimaryForward
             ? snap(baseY)
-            : snap(baseY + sideDirection * sideOffset + branchLevel * 24 + branchYOffset);
-        const entryX = snap(endX - 12);
-        const points = [
-            { x: snap(startX), y: snap(startY) },
-            { x: forkX, y: snap(startY) }
-        ];
-        if (branchCorridorY !== snap(startY)) {
-            points.push({ x: forkX, y: branchCorridorY });
+            : snap(baseY + sideDirection * sideOffset + branchLevel * spreadStep + branchYOffset);
+        const branchStart = !isPrimaryForward
+            ? {
+                x: snap(from.x + fromSize.width / 2),
+                y: snap(sideDirection < 0 ? from.y : (from.y + fromSize.height))
+            }
+            : { x: snap(startX), y: snap(startY) };
+        const entryX = snap(endX - 6);
+        const points = [branchStart];
+        if (!isPrimaryForward) {
+            // Hard side-path rule:
+            // leave gateway via top/bottom midpoint with an immediate vertical cue.
+            const immediateY = snap(branchStart.y + sideDirection * 24);
+            const sideRailY = immediateY !== snap(branchStart.y) ? immediateY : snap(branchStart.y);
+            if (sideRailY !== snap(branchStart.y)) {
+                points.push({ x: snap(branchStart.x), y: sideRailY });
+            }
+            points.push({ x: forkX, y: sideRailY });
+            if (branchCorridorY !== sideRailY) {
+                points.push({ x: forkX, y: branchCorridorY });
+            }
+        } else {
+            points.push({ x: forkX, y: snap(branchStart.y) });
+            if (branchCorridorY !== snap(branchStart.y)) {
+                points.push({ x: forkX, y: branchCorridorY });
+            }
         }
         points.push({ x: entryX, y: branchCorridorY });
         if (branchCorridorY !== snap(endY)) {
@@ -386,7 +642,7 @@ function routeFlow(
     // Non-linear forward routing (role change):
     // move through dedicated outer corridors to prevent edge/shape overlaps in the core model area.
     if (isPrimaryForward && !isLoop) {
-        const entryX = snap(endX - 12);
+        const entryX = snap(endX - 6);
         return [
             { x: snap(startX), y: snap(startY) },
             { x: entryX, y: snap(startY) },
@@ -396,10 +652,10 @@ function routeFlow(
     }
 
     const fanKey = `fan:${flow.from}`;
-    const fanForkX = corridorState.taskForks.get(fanKey) ?? snap(startX + 60);
+    const fanForkX = corridorState.taskForks.get(fanKey) ?? snap(startX + 36);
     corridorState.taskForks.set(fanKey, fanForkX);
-    const branchY = snap(startY + (relativeLane === 0 ? 0 : relativeLane * 84));
-    const entryX = snap(endX - 12);
+    const branchY = snap(startY + (relativeLane === 0 ? 0 : relativeLane * 72));
+    const entryX = snap(endX - 6);
 
     return [
         { x: snap(startX), y: snap(startY) },
@@ -409,6 +665,63 @@ function routeFlow(
         { x: entryX, y: snap(endY) },
         { x: snap(endX), y: snap(endY) }
     ];
+}
+
+function resolveGatewayBranchDirection(flow, allFlows, stepsById, laneMeta) {
+    const sourceStep = stepsById.get(flow.from);
+    const targetStep = stepsById.get(flow.to);
+    if (!sourceStep?._roleId || !targetStep) return 0;
+    const sourceLane = laneMeta?.[sourceStep._roleId];
+    if (!sourceLane) return 0;
+    const sourceCenter = sourceLane.y + sourceLane.height / 2;
+    const maxDepth = 24;
+    const queue = [{ stepId: flow.to, depth: 0 }];
+    const visited = new Set([flow.from]);
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || visited.has(current.stepId) || current.depth > maxDepth) continue;
+        visited.add(current.stepId);
+        const currentStep = stepsById.get(current.stepId);
+        if (!currentStep) continue;
+
+        if (currentStep._roleId && currentStep._roleId !== sourceStep._roleId) {
+            const lane = laneMeta?.[currentStep._roleId];
+            if (lane) {
+                const center = lane.y + lane.height / 2;
+                if (center < sourceCenter) return -1;
+                if (center > sourceCenter) return 1;
+            }
+        }
+
+        allFlows.forEach((candidate) => {
+            if (candidate.from !== current.stepId) return;
+            if (!visited.has(candidate.to)) {
+                queue.push({ stepId: candidate.to, depth: current.depth + 1 });
+            }
+        });
+    }
+
+    if (!targetStep._roleId) return 0;
+    const targetLane = laneMeta?.[targetStep._roleId];
+    if (!targetLane) return 0;
+    const targetCenter = targetLane.y + targetLane.height / 2;
+    if (targetCenter < sourceCenter) return -1;
+    if (targetCenter > sourceCenter) return 1;
+    return 0;
+}
+
+function resolveGatewayBranchDirectionWithFallback(flow, allFlows, stepsById, laneMeta, fromPos = null, toPos = null) {
+    const preferred = resolveGatewayBranchDirection(flow, allFlows, stepsById, laneMeta);
+    if (preferred !== 0) return preferred;
+    if (fromPos && toPos) {
+        if (toPos.y < fromPos.y) return -1;
+        if (toPos.y > fromPos.y) return 1;
+    }
+    const text = `${flow.from}->${flow.to}`;
+    let hash = 0;
+    for (let i = 0; i < text.length; i += 1) hash += text.charCodeAt(i);
+    return hash % 2 === 0 ? -1 : 1;
 }
 
 function isHorizontalSegment(a, b) {
@@ -478,7 +791,27 @@ function applyFlowBridges(flowWaypoints, flows, stepsById) {
         const flow = flows[flowIndex];
         const fromStep = stepsById.get(flow?.from);
         const toStep = stepsById.get(flow?.to);
+        const flowClass = classifyFlowRoutingClass(flow, fromStep);
+        if (flowClass === "gateway-side" || flowClass === "loop") return false;
         return fromStep?._roleId && toStep?._roleId && fromStep._roleId !== toStep._roleId;
+    };
+    const isProtectedBridgeSegment = (flowIndex, segmentIndex) => {
+        const flow = flows[flowIndex];
+        const sourceStep = stepsById.get(flow?.from);
+        const flowClass = classifyFlowRoutingClass(flow, sourceStep);
+        if (flowClass === "gateway-side" && segmentIndex < ROUTING_POLICY.PROTECT_GATEWAY_SIDE_EXIT_SEGMENTS) {
+            return true;
+        }
+        if (flowClass === "main" && segmentIndex < ROUTING_POLICY.PROTECT_MAIN_SOURCE_SEGMENTS) {
+            return true;
+        }
+        if (
+            flowClass === "loop"
+            && segmentIndex >= Math.max(0, (source?.[flowIndex]?.length || 0) - 1 - ROUTING_POLICY.PROTECT_LOOP_TARGET_SEGMENTS)
+        ) {
+            return true;
+        }
+        return false;
     };
     const isOrthogonalPoints = (points) => {
         for (let i = 0; i < points.length - 1; i += 1) {
@@ -515,6 +848,7 @@ function applyFlowBridges(flowWaypoints, flows, stepsById) {
                     const bridgeFlowIndex = preferJ ? j : i;
                     const bridgeSegIndex = bridgeFlowIndex === j ? b : a;
                     const bridgePoints = bridgeFlowIndex === j ? pointsB : pointsA;
+                    if (isProtectedBridgeSegment(bridgeFlowIndex, bridgeSegIndex)) continue;
 
                     const flowForBridge = flows[bridgeFlowIndex];
                     if (flowForBridge?._isBackEdge) continue;
@@ -612,10 +946,13 @@ function resolveInterFlowCrossings(flowWaypoints, flows = [], stepsById = null) 
             const flow = flows[i];
             if (flow?._preferShortestJoin || flow?._isBackEdge) continue;
             const sourceStep = stepsById && flow ? stepsById.get(flow.from) : null;
-            const protectGatewayExit = sourceStep?.type === "gateway";
-            if (protectGatewayExit) continue;
+            const flowClass = classifyFlowRoutingClass(flow, sourceStep);
+            if (flowClass === "gateway-side") continue;
 
             for (const seg of currentSegments) {
+                if (flowClass === "main" && seg.segIndex < ROUTING_POLICY.PROTECT_MAIN_SOURCE_SEGMENTS) {
+                    continue;
+                }
                 let conflictMove = null;
                 const allPrevious = result
                     .slice(0, i)
@@ -625,11 +962,11 @@ function resolveInterFlowCrossings(flowWaypoints, flows = [], stepsById = null) 
                     const cross = getSegmentIntersection(seg.a, seg.b, prev.a, prev.b);
                     if (cross && !isEndpointTouch(cross, seg) && !isEndpointTouch(cross, prev)) {
                         if (isVerticalSegment(seg.a, seg.b)) {
-                            conflictMove = { axis: "x", amount: -24 };
+                            conflictMove = { axis: "x", amount: -36 };
                         } else if (isHorizontalSegment(seg.a, seg.b) && isVerticalSegment(prev.a, prev.b)) {
-                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 24 };
+                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 36 };
                         } else {
-                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 24 };
+                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 36 };
                         }
                         break;
                     }
@@ -637,9 +974,9 @@ function resolveInterFlowCrossings(flowWaypoints, flows = [], stepsById = null) 
                     const overlapType = hasCollinearOverlap(seg, prev);
                     if (overlapType) {
                         if (overlapType === "vertical") {
-                            conflictMove = { axis: "x", amount: -24 };
+                            conflictMove = { axis: "x", amount: -36 };
                         } else {
-                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 24 };
+                            conflictMove = { axis: "y", amount: (i % 2 === 0 ? -1 : 1) * 36 };
                         }
                         break;
                     }
@@ -663,6 +1000,96 @@ function resolveInterFlowCrossings(flowWaypoints, flows = [], stepsById = null) 
     return result;
 }
 
+function separateParallelSegmentOverlaps(flowWaypoints, flows = [], stepsById = null) {
+    const result = flowWaypoints.map((points) => points.map((p) => ({ ...p })));
+
+    const segmentsOf = (points, flowIndex) => {
+        const segments = [];
+        for (let i = 0; i < points.length - 1; i += 1) {
+            const a = points[i];
+            const b = points[i + 1];
+            segments.push({
+                flowIndex,
+                segIndex: i,
+                a,
+                b,
+                horizontal: a.y === b.y && a.x !== b.x,
+                vertical: a.x === b.x && a.y !== b.y
+            });
+        }
+        return segments;
+    };
+
+    const overlapLength = (a1, a2, b1, b2) =>
+        Math.min(Math.max(a1, a2), Math.max(b1, b2)) - Math.max(Math.min(a1, a2), Math.min(b1, b2));
+
+    const nudgeSegment = (points, segIndex, axis, amount) => {
+        const p1 = points[segIndex];
+        const p2 = points[segIndex + 1];
+        if (!p1 || !p2) return false;
+        if (axis === "x") {
+            p1.x = snap(p1.x + amount);
+            p2.x = snap(p2.x + amount);
+            return true;
+        }
+        p1.y = snap(p1.y + amount);
+        p2.y = snap(p2.y + amount);
+        return true;
+    };
+
+    for (let pass = 0; pass < 4; pass += 1) {
+        let changed = false;
+
+        for (let i = 1; i < result.length; i += 1) {
+            const currentFlow = flows[i];
+            const currentSource = currentFlow ? stepsById?.get(currentFlow.from) : null;
+            const flowClass = classifyFlowRoutingClass(currentFlow, currentSource);
+            const protectGatewayExit = flowClass === "gateway-side";
+            const currentSegments = segmentsOf(result[i], i);
+            const previousSegments = result.slice(0, i).flatMap((points, idx) => segmentsOf(points, idx));
+
+            for (const seg of currentSegments) {
+                if (protectGatewayExit && seg.segIndex < ROUTING_POLICY.PROTECT_GATEWAY_SIDE_EXIT_SEGMENTS) continue;
+                if (
+                    flowClass === "loop"
+                    && seg.segIndex >= result[i].length - ROUTING_POLICY.PROTECT_LOOP_TARGET_SEGMENTS
+                ) continue;
+                if (seg.segIndex >= result[i].length - 2 && flowClass !== "loop") continue;
+                if (flowClass === "main" && seg.segIndex < ROUTING_POLICY.PROTECT_MAIN_SOURCE_SEGMENTS) continue;
+
+                for (const prev of previousSegments) {
+                    if (seg.horizontal && prev.horizontal && seg.a.y === prev.a.y) {
+                        const overlap = overlapLength(seg.a.x, seg.b.x, prev.a.x, prev.b.x);
+                        if (overlap > 28) {
+                            const direction = (i + seg.segIndex) % 2 === 0 ? 1 : -1;
+                            if (nudgeSegment(result[i], seg.segIndex, "y", direction * 24)) {
+                                changed = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (seg.vertical && prev.vertical && seg.a.x === prev.a.x) {
+                        const overlap = overlapLength(seg.a.y, seg.b.y, prev.a.y, prev.b.y);
+                        if (overlap > 28) {
+                            const direction = (i + seg.segIndex) % 2 === 0 ? 1 : -1;
+                            if (nudgeSegment(result[i], seg.segIndex, "x", direction * 24)) {
+                                changed = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (changed) break;
+            }
+        }
+
+        if (!changed) break;
+    }
+
+    return result;
+}
+
 function enforceOrthogonalWaypoints(flowWaypoints, flows = [], stepsById = null) {
     const usedVerticalRails = new Set();
     const usedHorizontalRails = new Set();
@@ -673,6 +1100,7 @@ function enforceOrthogonalWaypoints(flowWaypoints, flows = [], stepsById = null)
         const sourceStep = stepsById && flow ? stepsById.get(flow.from) : null;
         const preserveGatewayExitDiagonal = Boolean(
             sourceStep?.type === "gateway"
+            && flow?._isMain
             && points[1]
             && points[0].x !== points[1].x
             && points[0].y !== points[1].y
@@ -765,10 +1193,15 @@ function resolveFlowOverShapeIntersections(flowWaypoints, flows, stepRects, lane
             if (!flow || points.length < 2) continue;
             if (flow._preferShortestJoin) continue;
             const sourceStep = stepsById?.get(flow.from);
-            const protectGatewayExit = sourceStep?.type === "gateway";
+            const flowClass = classifyFlowRoutingClass(flow, sourceStep);
+            if (flowClass === "loop") continue;
+            const protectedGatewaySegments = flowClass === "gateway-side"
+                ? ROUTING_POLICY.PROTECT_GATEWAY_SIDE_EXIT_SEGMENTS
+                : 0;
 
             for (let s = 0; s < points.length - 1; s += 1) {
-                if (protectGatewayExit && s === 0) continue;
+                if (s < protectedGatewaySegments) continue;
+                if (flowClass === "main" && s < ROUTING_POLICY.PROTECT_MAIN_SOURCE_SEGMENTS) continue;
                 const a = points[s];
                 const b = points[s + 1];
 
@@ -833,6 +1266,8 @@ function enforceDominantForwardEdges(flowWaypoints, flows, stepsById, positions)
         const endY = toPos.y + toSize.height / 2;
         const sameRow = Math.abs(snap(startY) - snap(endY)) <= SNAP_GRID;
         const isTaskToGateway = fromStep.type !== "gateway" && toStep.type === "gateway";
+        const flowClass = classifyFlowRoutingClass(flow, fromStep);
+        if (flowClass === "gateway-side" || flowClass === "loop") return points;
 
         if (
             isPrimaryForward
@@ -857,7 +1292,7 @@ function enforceDominantForwardEdges(flowWaypoints, flows, stepsById, positions)
     });
 }
 
-function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions) {
+function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions, laneMeta, outgoingIndexMeta = null) {
     const incomingByTarget = new Map();
     flows.forEach((flow, idx) => {
         const list = incomingByTarget.get(flow.to) || [];
@@ -869,6 +1304,13 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions) {
         list.forEach((item, localIndex) => {
             incomingIndex.set(item.flowIndex, { localIndex, total: list.length });
         });
+    });
+    const loopFlows = flows
+        .map((flow, idx) => ({ flow, flowIndex: idx }))
+        .filter((entry) => Boolean(entry.flow?._isBackEdge));
+    const loopIncomingIndex = new Map();
+    loopFlows.forEach((entry, localIndex) => {
+        loopIncomingIndex.set(entry.flowIndex, { localIndex, total: loopFlows.length });
     });
 
     return flowWaypoints.map((points, index) => {
@@ -882,15 +1324,52 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions) {
 
         const fromSize = getNodeSize(fromStep);
         const toSize = getNodeSize(toStep);
-        const start = { x: Math.round(fromPos.x + fromSize.width), y: Math.round(fromPos.y + fromSize.height / 2) };
+        const outgoingMeta = outgoingIndexMeta?.get(index) || { localIndex: 0, isPrimary: false };
+        const branchKind = classifyBranchLabel(flow.condition);
+        const preferYesAsMain = shouldPreferYesAsMainExit(fromStep, flow, flows);
+        let isGatewayMainExit = isGatewayMainExitFlow(fromStep, flow, outgoingMeta)
+            || (
+                preferYesAsMain
+                && toPos.x > fromPos.x
+            );
+        if (
+            fromStep?.type === "gateway"
+            && branchKind === "yes"
+            && !flow?._isBackEdge
+            && toPos.x > fromPos.x
+        ) {
+            isGatewayMainExit = true;
+        }
+        const branchDirection = fromStep?.type === "gateway" && !isGatewayMainExit
+            ? ((branchKind === "no" || branchKind === "error")
+                ? 1
+                : resolveGatewayBranchDirectionWithFallback(flow, flows, stepsById, laneMeta, fromPos, toPos))
+            : 0;
+        const gatewayTopBottomStart = fromStep?.type === "gateway" && !isGatewayMainExit
+            ? {
+                x: Math.round(fromPos.x + fromSize.width / 2),
+                y: Math.round(branchDirection < 0 ? fromPos.y : (fromPos.y + fromSize.height))
+            }
+            : null;
+        const start = gatewayTopBottomStart || {
+            x: Math.round(fromPos.x + fromSize.width),
+            y: Math.round(fromPos.y + fromSize.height / 2)
+        };
         const inMeta = incomingIndex.get(index) || { localIndex: 0, total: 1 };
         const targetAnchorY = inMeta.total <= 1
             ? (toPos.y + toSize.height / 2)
             : (toPos.y + ((inMeta.localIndex + 1) * toSize.height) / (inMeta.total + 1));
-        const end = {
-            x: Math.round(toPos.x),
-            y: Math.round(targetAnchorY)
-        };
+        const isLoop = Boolean(flow._isBackEdge);
+        const targetCenterX = toPos.x + toSize.width / 2;
+        const end = isLoop
+            ? {
+                x: Math.round(targetCenterX),
+                y: Math.round(toPos.y + toSize.height)
+            }
+            : {
+                x: Math.round(toPos.x),
+                y: Math.round(toStep.type === "endEvent" ? (toPos.y + toSize.height / 2) : targetAnchorY)
+            };
 
         const safe = Array.isArray(points) ? points.map((p) => ({ ...p })) : [];
         if (safe.length < 2) {
@@ -904,11 +1383,44 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions) {
         if (fromStep.type !== "gateway" && second && second.x !== start.x && second.y !== start.y) {
             safe.splice(1, 0, { x: second.x, y: start.y });
         }
+        if (fromStep.type === "gateway") {
+            if (!isGatewayMainExit) {
+                const fallbackDir = safe[1]?.y > start.y ? 1 : safe[1]?.y < start.y ? -1 : 1;
+                const sideDir = branchDirection !== 0 ? branchDirection : fallbackDir;
+                const stubY = snap(start.y + sideDir * 24);
+                if (!safe[1]) safe.push({ x: start.x, y: stubY });
+                else {
+                    safe[1].x = start.x;
+                    safe[1].y = stubY;
+                }
+                if (!safe[2]) {
+                    safe.push({ x: snap(start.x + 48), y: stubY });
+                } else if (safe[2].y !== stubY) {
+                    safe.splice(2, 0, { x: safe[2].x, y: stubY });
+                }
+            } else if (safe[1]) {
+                safe[1].y = start.y;
+                if (safe[1].x <= start.x) safe[1].x = snap(start.x + 24);
+            }
+        }
 
+        const loopMeta = loopIncomingIndex.get(index) || { localIndex: 0, total: 1 };
+        const spreadIndex = loopMeta.localIndex - (loopMeta.total - 1) / 2;
+        const loopRailX = isLoop && loopMeta.total > 1
+            ? snap(end.x + (spreadIndex === 0 ? 24 : spreadIndex * 24))
+            : end.x;
         const prevIndex = safe.length - 2;
         const prev = safe[prevIndex];
         const last = safe[safe.length - 1];
-        if (prev && last && prev.x !== last.x && prev.y !== last.y) {
+        if (isLoop && prev && loopMeta.total > 1) {
+            if (prev.x !== loopRailX) {
+                safe.splice(safe.length - 1, 0, { x: loopRailX, y: prev.y });
+            }
+            const nearEnd = safe[safe.length - 2];
+            if (nearEnd.y !== last.y || nearEnd.x !== loopRailX) {
+                safe.splice(safe.length - 1, 0, { x: loopRailX, y: last.y });
+            }
+        } else if (prev && last && prev.x !== last.x && prev.y !== last.y) {
             safe.splice(safe.length - 1, 0, { x: last.x, y: prev.y });
         }
 
@@ -937,6 +1449,10 @@ function enforceGatewaySplitPattern(flowWaypoints, flows, stepsById) {
         if (fromStep?.type !== "gateway") return points;
 
         const result = points.map((p) => ({ ...p }));
+        if (!flow._isMain) {
+            // Hard side-branch rule: keep explicit side exit geometry untouched.
+            return result;
+        }
         const start = result[0];
         const branchKind = classifyBranchLabel(flow.condition);
         if (!result[1]) return result;
@@ -1021,7 +1537,7 @@ function computeMainPath(startId, flows, rank) {
                 const rankB = (rank[b.to] ?? currentRank) - currentRank;
                 const kindA = classifyBranchLabel(a.condition);
                 const kindB = classifyBranchLabel(b.condition);
-                const kindScore = (kind) => (kind === "no" ? 3 : kind === "yes" ? 2 : 1);
+                const kindScore = (kind) => (kind === "yes" ? 3 : kind === "no" ? 1 : 2);
                 return (rankB + kindScore(kindB)) - (rankA + kindScore(kindA));
             })[0];
 
@@ -1034,7 +1550,33 @@ function computeMainPath(startId, flows, rank) {
     return path;
 }
 
-export function generateBPMN(process) {
+function branchLeadsToLoop(startId, flows, rank, thresholdRank) {
+    const outgoingBySource = new Map();
+    flows.forEach((flow) => {
+        const list = outgoingBySource.get(flow.from) || [];
+        list.push(flow.to);
+        outgoingBySource.set(flow.from, list);
+    });
+    const visited = new Set();
+    const queue = [startId];
+    let guard = 0;
+    while (queue.length > 0 && guard < flows.length * 4 + 16) {
+        guard += 1;
+        const current = queue.shift();
+        if (!current || visited.has(current)) continue;
+        visited.add(current);
+        const currentRank = Number(rank[current] ?? Number.MAX_SAFE_INTEGER);
+        if (currentRank < thresholdRank) return true;
+        const nextTargets = outgoingBySource.get(current) || [];
+        nextTargets.forEach((nextId) => {
+            if (!visited.has(nextId)) queue.push(nextId);
+        });
+    }
+    return false;
+}
+
+export function generateBPMN(process, options = {}) {
+    const strictQuality = Boolean(options?.strictQuality);
     const roles = Array.isArray(process?.roles) && process.roles.length > 0 ? process.roles : ["System"];
     const processAnnotations = Array.isArray(process?.annotations)
         ? JSON.parse(JSON.stringify(process.annotations))
@@ -1158,7 +1700,14 @@ export function generateBPMN(process) {
         mainEdges.add(`${mainPath[i]}->${mainPath[i + 1]}`);
     }
     normalizedFlows.forEach((flow) => {
-        flow._isMain = mainEdges.has(`${flow.from}->${flow.to}`);
+        const fromRank = Number(rank[flow.from] ?? 0);
+        const toRank = Number(rank[flow.to] ?? 0);
+        const loopByRank = toRank <= fromRank;
+        const fromStep = stepById.get(flow.from);
+        const gatewayBranchLeadsToLoop = fromStep?.type === "gateway"
+            && branchLeadsToLoop(flow.to, normalizedFlows, rank, fromRank);
+        flow._leadsToLoop = Boolean(gatewayBranchLeadsToLoop);
+        flow._isMain = mainEdges.has(`${flow.from}->${flow.to}`) && !loopByRank && !gatewayBranchLeadsToLoop;
     });
 
     const roleRankGroups = new Map();
@@ -1174,10 +1723,10 @@ export function generateBPMN(process) {
     const positions = {};
     const laneMeta = {};
     const STEP_SLOT = 84;
-    const LANE_BRANCH_OFFSET = 84;
+    const LANE_BRANCH_OFFSET = 72;
     const LANE_PADDING = 16;
-    const LANE_BASE_HEIGHT = 84;
-    const LANE_GAP = 16;
+    const LANE_BASE_HEIGHT = 120;
+    const LANE_GAP = 12;
     let currentY = 88;
 
     const stepByIdWithStart = new Map(steps.map((step) => [step.id, step]));
@@ -1191,7 +1740,7 @@ export function generateBPMN(process) {
     const maxOutDegree = Math.max(1, ...steps.map((step) => outgoingBySource.get(step.id) || 0));
     const maxInDegree = Math.max(1, ...steps.map((step) => incomingByTarget.get(step.id) || 0));
     const isLinearLike = !hasGateway && maxOutDegree <= 1 && maxInDegree <= 1;
-    const RANK_SPACING = isLinearLike ? 196 : hasGateway ? 260 : 224;
+    const RANK_SPACING = isLinearLike ? 188 : hasGateway ? 252 : 212;
     const BASE_X = isLinearLike ? 156 : 180;
 
     const gatewayBranchOffsetByTarget = new Map();
@@ -1234,7 +1783,7 @@ export function generateBPMN(process) {
             if (s?.type !== "gateway") return max;
             return Math.max(max, (outgoingBySourceList.get(stepId) || []).length);
         }, 1);
-        const branchBuffer = Math.max(0, maxFanIn - 1) * 18 + Math.max(0, maxFanOut - 1) * 14;
+        const branchBuffer = Math.max(0, maxFanIn - 1) * 20 + Math.max(0, maxFanOut - 1) * 16;
         const gatewayBranchBuffer = Math.max(0, maxGatewayFanOut - 1) * 30;
         const maxStack = Math.max(1, ...groupSizes);
         const stackHeight = (maxStack - 1) * STEP_SLOT + 60;
@@ -1332,7 +1881,8 @@ export function generateBPMN(process) {
     }
 
     // Keep primary forward branch on source row when a split exists in same role.
-    const outgoingMetaByFlow = buildOutgoingIndex(normalizedFlows, positions, stepById);
+    const longestPathToEnd = computeLongestPathToEnd(steps, normalizedFlows);
+    const outgoingMetaByFlow = buildOutgoingIndex(normalizedFlows, positions, stepById, longestPathToEnd);
     normalizedFlows.forEach((flow, flowIndex) => {
         const meta = outgoingMetaByFlow.get(flowIndex) || { localIndex: 0, total: 1 };
         if (meta.total <= 1 || meta.localIndex !== 0) return;
@@ -1379,6 +1929,10 @@ export function generateBPMN(process) {
         toPos.y = snap(Math.max(minY, Math.min(maxY, sourceCenterY - toSize.height / 2)));
     });
 
+    // Reuse the relayout strategy from the editor button:
+    // resolve shape overlaps inside each lane before edge routing.
+    resolveLaneNodeOverlaps(steps, positions, laneMeta, LANE_PADDING);
+
     const firstFlow = normalizedFlows.find((flow) => flow.from === startId);
     if (firstFlow && positions[firstFlow.to]) {
         const firstTargetStep = steps.find((step) => step.id === firstFlow.to);
@@ -1411,6 +1965,61 @@ export function generateBPMN(process) {
         }
     }
 
+    const nonEndRight = Math.max(
+        ...steps
+            .filter((step) => step.type !== "endEvent")
+            .map((step) => {
+                const pos = positions[step.id];
+                const size = getNodeSize(step);
+                return (pos?.x || 0) + size.width;
+            })
+    );
+    const endByRole = new Map();
+    steps.filter((step) => step.type === "endEvent").forEach((step) => {
+        const key = step._roleId || "_default";
+        const list = endByRole.get(key) || [];
+        list.push(step);
+        endByRole.set(key, list);
+    });
+    endByRole.forEach((endSteps, roleId) => {
+        const lane = laneMeta[roleId];
+        endSteps.forEach((step, idx) => {
+            const pos = positions[step.id];
+            if (!pos) return;
+            const size = getNodeSize(step);
+            const preferredCenterY = lane ? lane.y + lane.height / 2 : pos.y + size.height / 2;
+            const minY = lane ? lane.y + LANE_PADDING : pos.y;
+            const maxY = lane ? lane.y + lane.height - LANE_PADDING - size.height : pos.y;
+            pos.x = snap(nonEndRight + 144 + idx * 60);
+            pos.y = snap(Math.max(minY, Math.min(maxY, preferredCenterY - size.height / 2)));
+        });
+    });
+
+    // Adaptive compaction: tighten horizontal whitespace inside lanes,
+    // but only for simple nodes to avoid creating crossing clusters.
+    compactLaneHorizontalGaps(steps, positions, normalizedFlows, laneMeta);
+
+    // Keep gateway successors from collapsing onto the split point.
+    for (let pass = 0; pass < 3; pass += 1) {
+        let moved = false;
+        normalizedFlows.forEach((flow) => {
+            const fromStep = stepById.get(flow.from);
+            const toStep = stepById.get(flow.to);
+            if (!fromStep || !toStep || fromStep.type !== "gateway") return;
+            const fromPos = positions[flow.from];
+            const toPos = positions[flow.to];
+            if (!fromPos || !toPos) return;
+            const fromSize = getNodeSize(fromStep);
+            const minGap = 84;
+            const minTargetX = snap(fromPos.x + fromSize.width + minGap);
+            if (toPos.x < minTargetX) {
+                toPos.x = minTargetX;
+                moved = true;
+            }
+        });
+        if (!moved) break;
+    }
+
     normalizedFlows.forEach((flow) => {
         const fromStep = stepById.get(flow.from);
         const toStep = stepById.get(flow.to);
@@ -1420,7 +2029,9 @@ export function generateBPMN(process) {
         const fromSize = getNodeSize(fromStep);
         const startXGeom = fromPos.x + fromSize.width;
         const endXGeom = toPos.x;
-        flow._isBackEdge = endXGeom <= startXGeom;
+        const fromRank = Number(rank[flow.from] ?? 0);
+        const toRank = Number(rank[flow.to] ?? 0);
+        flow._isBackEdge = toRank <= fromRank;
     });
 
     const nodeBounds = steps.map((step) => {
@@ -1472,6 +2083,23 @@ export function generateBPMN(process) {
         if (minW > diagramWidth) diagramWidth = minW;
     }
 
+    const gatewayDefaultFlowByStepId = new Map();
+    const gatewayOutflows = new Map();
+    normalizedFlows.forEach((flow, idx) => {
+        const source = stepById.get(flow.from);
+        if (source?.type !== "gateway") return;
+        const list = gatewayOutflows.get(flow.from) || [];
+        list.push({ idx, kind: classifyBranchLabel(flow.condition) });
+        gatewayOutflows.set(flow.from, list);
+    });
+    gatewayOutflows.forEach((list, gatewayId) => {
+        if (list.length < 2) return;
+        const noBranch = list.find((item) => item.kind === "no");
+        const errorBranch = list.find((item) => item.kind === "error");
+        const defaultBranch = noBranch || errorBranch || list[list.length - 1];
+        gatewayDefaultFlowByStepId.set(gatewayId, `flow_${defaultBranch.idx}`);
+    });
+
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions
 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -1498,10 +2126,13 @@ id="Defs_1">
         if (step.type === "startEvent") {
             xml += `<bpmn:startEvent id="${step.id}" name="${name}" />`;
         } else if (step.type === "endEvent") {
-            xml += `<bpmn:endEvent id="${step.id}" name="${name}" />`;
+            const endName = name === "undefined" ? "Ende" : name;
+            xml += `<bpmn:endEvent id="${step.id}" name="${endName}" />`;
         } else if (step.type === "gateway") {
-            const gatewayName = name === "undefined" ? "Entscheidung" : name;
-            xml += `<bpmn:exclusiveGateway id="${step.id}" name="${gatewayName}" />`;
+            const gatewayName = normalizeGatewayDisplayName(name === "undefined" ? "Entscheidung" : name);
+            const defaultFlowRef = gatewayDefaultFlowByStepId.get(step.id);
+            const defaultAttr = defaultFlowRef ? ` default="${defaultFlowRef}"` : "";
+            xml += `<bpmn:exclusiveGateway id="${step.id}" name="${gatewayName}"${defaultAttr} />`;
         } else if (step.type === "boundaryTimer") {
             const cancel = step.interrupting === false ? "false" : "true";
             const dur = typeof step.duration === "string" && step.duration
@@ -1542,7 +2173,6 @@ id="Defs_1">
             && toStep?.type === "gateway"
             && fromPos
             && toPos
-            && toPos.x > fromPos.x
         );
     });
     steps.forEach((step) => {
@@ -1559,7 +2189,7 @@ id="Defs_1">
         xml += `<bpmndi:BPMNShape bpmnElement="${ann.id}"><dc:Bounds x="${ann.x}" y="${ann.y}" width="${ann.w}" height="${ann.h}" /></bpmndi:BPMNShape>`;
     });
 
-    const outgoingIndexMeta = buildOutgoingIndex(normalizedFlows, positions, stepsById);
+    const outgoingIndexMeta = buildOutgoingIndex(normalizedFlows, positions, stepsById, longestPathToEnd);
     const horizontalBands = new Map();
     const loopBands = new Map();
     const laneBounds = {
@@ -1583,12 +2213,14 @@ id="Defs_1">
             i,
             stepsById,
             positions,
+            normalizedFlows,
             outgoingIndexMeta,
             horizontalBands,
             loopBands,
             corridorState,
             laneBounds,
-            laneMeta
+            laneMeta,
+            strictQuality
         );
         return waypoints || [];
     });
@@ -1629,15 +2261,34 @@ id="Defs_1">
         splitPatternWaypoints,
         normalizedFlows,
         stepsById,
-        positions
+        positions,
+        laneMeta,
+        outgoingIndexMeta
     );
     const postEndpointResolved = resolveInterFlowCrossings(endpointSafeWaypoints, normalizedFlows, stepsById);
     const postEndpointOrthogonal = enforceOrthogonalWaypoints(postEndpointResolved, normalizedFlows, stepsById);
+    const postEndpointSeparated = separateParallelSegmentOverlaps(postEndpointOrthogonal, normalizedFlows, stepsById);
+    const postEndpointSeparatedOrthogonal = enforceOrthogonalWaypoints(postEndpointSeparated, normalizedFlows, stepsById);
+    const postEndpointCollisionReduced = resolveFlowOverShapeIntersections(
+        postEndpointSeparatedOrthogonal,
+        normalizedFlows,
+        stepRects,
+        laneBounds,
+        stepsById
+    );
+    const postEndpointCollisionOrthogonal = enforceOrthogonalWaypoints(
+        postEndpointCollisionReduced,
+        normalizedFlows,
+        stepsById
+    );
+    const withFlowBridges = applyFlowBridges(postEndpointCollisionOrthogonal, normalizedFlows, stepsById);
     const finalEndpointWaypoints = enforceFlowEndpoints(
-        postEndpointOrthogonal,
+        withFlowBridges,
         normalizedFlows,
         stepsById,
-        positions
+        positions,
+        laneMeta,
+        outgoingIndexMeta
     );
     normalizedFlows.forEach((flow, i) => {
         const waypoints = compactOrthogonalWaypoints(finalEndpointWaypoints[i] || []);
@@ -1656,7 +2307,7 @@ id="Defs_1">
             )
             : waypoints[0];
         const labelWidth = Math.max(48, Math.min(180, String(flow.condition || "").length * 7));
-        const labelBounds = placeEdgeLabelBounds(labelAnchor, labelWidth, 18, stepRects);
+        const labelBounds = placeEdgeLabelBounds(labelAnchor, labelWidth, 18, stepRects, 0);
         const labelXml = hasConditionLabel
             ? `<bpmndi:BPMNLabel><dc:Bounds x="${labelBounds.x}" y="${labelBounds.y}" width="${labelBounds.width}" height="${labelBounds.height}" /></bpmndi:BPMNLabel>`
             : "";

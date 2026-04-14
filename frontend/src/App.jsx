@@ -63,6 +63,22 @@ const escapeHtml = (value) => String(value)
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const tokenizeWords = (input) => String(input || "").match(/[\p{L}][\p{L}\p{N}-]*/gu) || [];
 const normalizeWord = (word) => String(word || "").toLowerCase().trim();
+const QUALITY_GATE_REASON_LABELS = {
+    outOfWorkspaceFlows: "Flows außerhalb des Arbeitsbereichs",
+    flowCrossingsAvoidable: "Vermeidbare Kreuzungen",
+    flowShapeOverlaps: "Flow-über-Element Überlagerungen"
+};
+const QUALITY_GATE_REASON_ACTIONS = {
+    outOfWorkspaceFlows: "Betroffene Schritte dichter im Lane-Bereich platzieren oder Relayout ausführen.",
+    flowCrossingsAvoidable: "Verzweigungen horizontal entzerren und parallele Pfade vertikal staffeln.",
+    flowShapeOverlaps: "Zwischen betroffenen Elementen mehr Abstand schaffen und Kanten neu routen."
+};
+
+const QUALITY_GATE_STATUS_LABELS = {
+    passed_initial: "Bestanden (direkt)",
+    passed_relayout: "Bestanden (nach Relayout)",
+    failed_after_relayout: "Warnung nach Relayout"
+};
 
 const getStemFromVerbLikeTerm = (word) => normalizeWord(word)
     .replace(/(ieren|ern|eln|en|n)$/u, "")
@@ -130,12 +146,23 @@ function App() {
     const [xml, setXml] = useState("");
     const [json, setJson] = useState(null);
     const [error, setError] = useState("");
+    const [warning, setWarning] = useState("");
     const [status, setStatus] = useState("Bereit");
     const [isLoading, setIsLoading] = useState(false);
     const [showDownloadOptions, setShowDownloadOptions] = useState(false);
     const [isExporting, setIsExporting] = useState(false);
     const [isExtractingDocument, setIsExtractingDocument] = useState(false);
     const [isDragOverEditor, setIsDragOverEditor] = useState(false);
+    const [useAiOptimization, setUseAiOptimization] = useState(true);
+    const [optimizedInputPreview, setOptimizedInputPreview] = useState("");
+    const [qualityScorecard, setQualityScorecard] = useState(null);
+    const [qualityGateStatus, setQualityGateStatus] = useState("");
+    const [qualityGateMessage, setQualityGateMessage] = useState("");
+    const [modelsEvaluated, setModelsEvaluated] = useState(0);
+    const [recentQualityScores, setRecentQualityScores] = useState([]);
+    const [showRoutingDebug, setShowRoutingDebug] = useState(false);
+    const [routingDebug, setRoutingDebug] = useState(null);
+    const [showLoopsOnly, setShowLoopsOnly] = useState(false);
     const [allocationSearch, setAllocationSearch] = useState("");
     const [allocationElementFilter, setAllocationElementFilter] = useState("all");
     const [allocationSortBy, setAllocationSortBy] = useState("source");
@@ -421,16 +448,47 @@ function App() {
         }
 
         setError("");
+        setWarning("");
+        setQualityGateStatus("");
+        setQualityGateMessage("");
         setShowDownloadOptions(true);
-        setStatus("Analysiere Prozess...");
+        setStatus(useAiOptimization ? "Optimiere Text fuer KI-Analyse..." : "Analysiere Prozess...");
         setIsLoading(true);
         try {
-            const res = await fetch(`${API_BASE_URL}/api/generate`, {
+            let analysisText = trimmedText;
+            if (useAiOptimization) {
+                try {
+                    const optimizeRes = await fetch(`${API_BASE_URL}/api/optimize`, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({ text: trimmedText })
+                    });
+                    const optimizeData = await optimizeRes.json();
+                    if (optimizeRes.ok && optimizeData.success && optimizeData.optimizedText) {
+                        analysisText = String(optimizeData.optimizedText).trim();
+                        setOptimizedInputPreview(analysisText);
+                        setStatus("Text optimiert. Analysiere Prozess...");
+                    } else {
+                        setOptimizedInputPreview("");
+                        setStatus("KI-Optimierung nicht verfuegbar. Analysiere Originaltext...");
+                    }
+                } catch (_err) {
+                    setOptimizedInputPreview("");
+                    setStatus("KI-Optimierung nicht erreichbar. Analysiere Originaltext...");
+                }
+            } else {
+                setOptimizedInputPreview("");
+            }
+
+            const debugQuery = showRoutingDebug ? "?debugRouting=true" : "";
+            const res = await fetch(`${API_BASE_URL}/api/generate${debugQuery}`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
-                body: JSON.stringify({ text: trimmedText })
+                body: JSON.stringify({ text: analysisText })
             });
 
             const data = await res.json();
@@ -438,14 +496,58 @@ function App() {
             if (res.ok && data.success) {
                 setJson(data.json);
                 setXml(data.xml);
-                setStatus("Analyse erfolgreich.");
+                setQualityScorecard(data.qualityScorecard || null);
+                setQualityGateStatus(String(data?.qualityGateStatus || ""));
+                setQualityGateMessage(String(data?.qualityGateMessage || ""));
+                setModelsEvaluated(Number(data?.learning?.totalModelsEvaluated || 0));
+                setRecentQualityScores(Array.isArray(data?.learning?.recentScores) ? data.learning.recentScores : []);
+                setRoutingDebug(data?.routingDebug || null);
+                if (data?.qualityGateStatus === "failed_after_relayout") {
+                    const gateMsg = String(data?.qualityGateMessage || "").trim()
+                        || "Qualitaetsgrenzen weiterhin verletzt; Best-Effort-Modell angezeigt.";
+                    setWarning(gateMsg);
+                    setStatus("Analyse erfolgreich (mit Quality-Warnung).");
+                } else {
+                    setWarning("");
+                    setStatus("Analyse erfolgreich.");
+                }
             } else {
-                setError(data.error || "Unbekannter Fehler bei der Analyse.");
-                setStatus("Analyse fehlgeschlagen.");
+                const backendMessage = data?.error || data?.message || "Unbekannter Fehler bei der Analyse.";
+                const backendCode = String(data?.code || "").trim();
+                const details = data?.qualityScorecard?.metrics;
+                if (backendCode === "QUALITY_GATE_FAILED") {
+                    setJson(data.json || null);
+                    setXml(data.xml || "");
+                    setQualityScorecard(data.qualityScorecard || null);
+                    setQualityGateStatus(String(data?.qualityGateStatus || "failed_after_relayout"));
+                    setQualityGateMessage(String(data?.error || data?.message || ""));
+                    setRoutingDebug(data?.routingDebug || null);
+                    const metricHint = details
+                        ? ` outOfWorkspace=${details.outOfWorkspaceFlows}, avoidableCrossings=${details.flowCrossingsAvoidable}, flowShapeOverlaps=${details.flowShapeOverlaps}`
+                        : "";
+                    setWarning(`Quality Gate blockiert die Ausgabe im Strict-Modus: ${backendMessage}.${metricHint}`);
+                    setError("");
+                    setStatus("Analyse abgelehnt: Quality-Gate verletzt.");
+                } else {
+                    setQualityScorecard(null);
+                    setQualityGateStatus("");
+                    setQualityGateMessage("");
+                    setRecentQualityScores([]);
+                    setRoutingDebug(null);
+                    setWarning("");
+                    setError(backendCode ? `${backendCode}: ${backendMessage}` : backendMessage);
+                    setStatus("Analyse fehlgeschlagen.");
+                }
             }
 
         } catch (err) {
             console.error(err);
+            setQualityScorecard(null);
+            setQualityGateStatus("");
+            setQualityGateMessage("");
+            setRecentQualityScores([]);
+            setRoutingDebug(null);
+            setWarning("");
             setError(`Backend nicht erreichbar unter ${API_BASE_URL}.`);
             setStatus("Backend nicht erreichbar.");
         } finally {
@@ -640,6 +742,7 @@ function App() {
 
     const handleRelayout = async () => {
         setError("");
+        setWarning("");
         setStatus("Ordne Elemente neu an...");
         const relayoutDone = await relayoutCurrentDiagram();
         if (relayoutDone) {
@@ -722,6 +825,7 @@ function App() {
             await runAnalysis(extractedText);
         } catch (err) {
             setError(err?.message || "Dokument konnte nicht verarbeitet werden.");
+            setWarning("");
             setStatus("Dokument-Extraktion fehlgeschlagen.");
         } finally {
             setIsExtractingDocument(false);
@@ -792,6 +896,7 @@ function App() {
             setStatus("BPMN-Datei wurde heruntergeladen.");
         } catch (err) {
             setError(err?.message || "BPMN-Export fehlgeschlagen.");
+            setWarning("");
             setStatus("BPMN-Export fehlgeschlagen.");
         } finally {
             setIsExporting(false);
@@ -807,6 +912,7 @@ function App() {
             setStatus("SVG-Datei wurde heruntergeladen.");
         } catch (err) {
             setError(err?.message || "SVG-Export fehlgeschlagen.");
+            setWarning("");
             setStatus("SVG-Export fehlgeschlagen.");
         } finally {
             setIsExporting(false);
@@ -844,6 +950,7 @@ function App() {
             setStatus("PDF-Datei wurde heruntergeladen.");
         } catch (err) {
             setError(err?.message || "PDF-Export fehlgeschlagen.");
+            setWarning("");
             setStatus("PDF-Export fehlgeschlagen.");
         } finally {
             setIsExporting(false);
@@ -1156,7 +1263,30 @@ function App() {
                 <button className="analyze-button" onClick={handleAnalyze} disabled={isLoading}>
                     {isLoading ? "Analysiere..." : "Prozessmodell generieren"}
                 </button>
+                <label className="ai-toggle">
+                    <input
+                        type="checkbox"
+                        checked={useAiOptimization}
+                        onChange={(e) => setUseAiOptimization(e.target.checked)}
+                        disabled={isLoading || isExtractingDocument}
+                    />
+                    KI-Optimierung
+                </label>
+                <label className="ai-toggle">
+                    <input
+                        type="checkbox"
+                        checked={showRoutingDebug}
+                        onChange={(e) => setShowRoutingDebug(e.target.checked)}
+                        disabled={isLoading || isExtractingDocument}
+                    />
+                    Routing-Debug
+                </label>
             </div>
+            {useAiOptimization && optimizedInputPreview ? (
+                <div className="optimized-preview-note">
+                    KI-optimierter Text wurde fuer die Generierung verwendet. Der Originaltext bleibt unveraendert.
+                </div>
+            ) : null}
             <input
                 ref={fileInputRef}
                 type="file"
@@ -1167,6 +1297,11 @@ function App() {
             {error ? (
                 <div className="error-box">
                     {error}
+                </div>
+            ) : null}
+            {warning ? (
+                <div className="warning-box">
+                    {warning}
                 </div>
             ) : null}
 
@@ -1214,6 +1349,85 @@ function App() {
                     <div>Anzahl identifizierter Aktivitäten: <strong>{activitiesCount}</strong></div>
                     <div>Anzahl identifizierter Gateways: <strong>{gatewaysCount}</strong></div>
                 </div>
+                {qualityScorecard ? (
+                    <div className="quality-scorecard">
+                        <h3>Qualität & Lerntrend</h3>
+                        <div>Qualitätsscore: <strong>{qualityScorecard.score}/{qualityScorecard.maxScore}</strong> ({qualityScorecard.percent}%)</div>
+                        <div>Qualitätsnote: <strong>{qualityScorecard.grade}</strong></div>
+                        <div>Modelle bewertet: <strong>{modelsEvaluated}</strong></div>
+                        <div className="quality-gate-summary">
+                            <span className={`quality-gate-badge quality-gate-severity-${qualityScorecard?.gate?.severity || "info"}`}>
+                                {QUALITY_GATE_STATUS_LABELS[qualityGateStatus] || "Keine Gate-Information"}
+                            </span>
+                            <span>
+                                Gate-Severity: <strong>{String(qualityScorecard?.gate?.severity || "info").toUpperCase()}</strong>
+                            </span>
+                        </div>
+                        {qualityGateMessage ? (
+                            <div className="quality-gate-message">{qualityGateMessage}</div>
+                        ) : null}
+                        {Array.isArray(qualityScorecard?.gate?.reasons) && qualityScorecard.gate.reasons.length > 0 ? (
+                            <div className="quality-gate-reasons">
+                                {qualityScorecard.gate.reasons.map((reason) => (
+                                    <div key={reason} className="quality-gate-reason-item">
+                                        <strong>{QUALITY_GATE_REASON_LABELS[reason] || reason}:</strong>{" "}
+                                        {reason === "outOfWorkspaceFlows" ? qualityScorecard?.metrics?.outOfWorkspaceFlows : null}
+                                        {reason === "flowCrossingsAvoidable" ? qualityScorecard?.metrics?.flowCrossingsAvoidable : null}
+                                        {reason === "flowShapeOverlaps" ? qualityScorecard?.metrics?.flowShapeOverlaps : null}
+                                        <div className="quality-gate-reason-action">
+                                            Empfehlung: {QUALITY_GATE_REASON_ACTIONS[reason] || "Layout erneut berechnen und kritische Kanten prüfen."}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="quality-ok">Quality Gate ohne aktive Layout-Warnursachen.</div>
+                        )}
+                        {recentQualityScores.length > 0 ? (
+                            <div className="quality-trend">
+                                <strong>Trend letzte 5:</strong>
+                                {recentQualityScores.map((entry, idx) => (
+                                    <span key={`${entry.at}-${idx}`} className="quality-trend-chip">
+                                        {entry.percent}% ({entry.grade})
+                                    </span>
+                                ))}
+                            </div>
+                        ) : null}
+                        {Array.isArray(qualityScorecard.violations) && qualityScorecard.violations.length > 0 ? (
+                            <div className="quality-violations">
+                                {qualityScorecard.violations.slice(0, 3).map((violation) => (
+                                    <div key={`${violation.code}-${violation.title}`} className="quality-violation-item">
+                                        <strong>{violation.code}:</strong> {violation.suggestion}
+                                    </div>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="quality-ok">Keine kritischen Regelverstöße erkannt.</div>
+                        )}
+                        {showRoutingDebug && routingDebug?.flows?.length > 0 ? (
+                            <div className="quality-trend">
+                                <strong>Routing-Typen:</strong>
+                                <label className="ai-toggle quality-inline-toggle">
+                                    <input
+                                        type="checkbox"
+                                        checked={showLoopsOnly}
+                                        onChange={(e) => setShowLoopsOnly(e.target.checked)}
+                                        disabled={isLoading}
+                                    />
+                                    nur loops
+                                </label>
+                                {(showLoopsOnly
+                                    ? routingDebug.flows.filter((flow) => flow.type === "loop")
+                                    : routingDebug.flows
+                                ).slice(0, 10).map((flow) => (
+                                    <span key={flow.id} className={`quality-trend-chip flow-chip-${flow.type}`}>
+                                        {flow.id}:{flow.type}
+                                    </span>
+                                ))}
+                            </div>
+                        ) : null}
+                    </div>
+                ) : null}
             </div>
 
             <div className="allocation-list">

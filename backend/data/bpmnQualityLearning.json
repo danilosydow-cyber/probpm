@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-04-14T13:46:26.298Z",
+  "totalModelsEvaluated": 3,
+  "violationCounts": {
+    "MISSING_END_EVENT": 1,
+    "DEAD_END_ACTIVITY": 1,
+    "LAYOUT_COLLISIONS_DETECTED": 1
+  },
+  "recentScores": [
+    {
+      "at": "2026-04-14T13:46:26.298Z",
+      "score": 80,
+      "maxScore": 100,
+      "percent": 80,
+      "grade": "B"
+    },
+    {
+      "at": "2026-04-14T13:46:26.285Z",
+      "score": 131,
+      "maxScore": 135,
+      "percent": 97,
+      "grade": "A"
+    },
+    {
+      "at": "2026-04-14T13:46:26.272Z",
+      "score": 110,
+      "maxScore": 135,
+      "percent": 81,
+      "grade": "B"
+    }
+  ]
+}

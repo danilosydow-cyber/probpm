@@ -1,0 +1,151 @@
+{
+  "version": "1.0.0",
+  "lastUpdated": "2026-04-14",
+  "source": "BPMN 2.0 best practices plus project-specific modeling conventions",
+  "instructions": [
+    {
+      "id": "ins_001",
+      "category": "core",
+      "title": "Model one process outcome clearly",
+      "level": "basic",
+      "priority": "must",
+      "guideline": "Use one clear start and explicit end states so the happy path and exception paths are understandable.",
+      "rationale": "Clear process boundaries improve readability and prevent hidden dead-ends."
+    },
+    {
+      "id": "ins_002",
+      "category": "events",
+      "title": "Start and end events are mandatory",
+      "level": "basic",
+      "priority": "must",
+      "guideline": "Always model at least one start event and one end event.",
+      "rationale": "Events define lifecycle boundaries and support BPMN-compliant execution semantics."
+    },
+    {
+      "id": "ins_003",
+      "category": "tasks",
+      "title": "Use action-oriented task labels",
+      "level": "basic",
+      "priority": "should",
+      "guideline": "Task labels should be verb-first and short, e.g. 'Bestellung prüfen'.",
+      "rationale": "Verb-based labels reduce ambiguity and improve process comprehension."
+    },
+    {
+      "id": "ins_004",
+      "category": "gateways",
+      "title": "Use gateways only for real decisions",
+      "level": "basic",
+      "priority": "must",
+      "guideline": "Create XOR gateways only when process flow can branch based on conditions.",
+      "rationale": "Unnecessary gateways add noise and reduce model quality."
+    },
+    {
+      "id": "ins_005",
+      "category": "gateways",
+      "title": "Label gateway branches consistently",
+      "level": "advanced",
+      "priority": "must",
+      "guideline": "Use explicit condition labels, preferably 'Ja' and 'Nein' for binary decisions.",
+      "rationale": "Consistent branch labels reduce interpretation errors."
+    },
+    {
+      "id": "ins_006",
+      "category": "gateways",
+      "title": "Set a default path for XOR gateways",
+      "level": "advanced",
+      "priority": "should",
+      "guideline": "Define a default outgoing sequence flow when one path should be the fallback.",
+      "rationale": "Default flows improve deterministic behavior and readability."
+    },
+    {
+      "id": "ins_007",
+      "category": "swimlanes",
+      "title": "Assign every task to a responsible role",
+      "level": "basic",
+      "priority": "must",
+      "guideline": "Each activity must belong to exactly one lane/role.",
+      "rationale": "Clear responsibilities are required for operational clarity."
+    },
+    {
+      "id": "ins_008",
+      "category": "layout",
+      "title": "Keep flow direction left-to-right",
+      "level": "basic",
+      "priority": "should",
+      "guideline": "Use dominant forward edges and avoid back edges unless loops are required.",
+      "rationale": "Left-to-right flow reduces cognitive load."
+    },
+    {
+      "id": "ins_009",
+      "category": "layout",
+      "title": "Avoid edge crossings in lane area",
+      "level": "advanced",
+      "priority": "must",
+      "guideline": "Route sequence flows orthogonally and avoid non-endpoint crossings.",
+      "rationale": "Crossings lower readability and hide control-flow intent."
+    },
+    {
+      "id": "ins_010",
+      "category": "quality",
+      "title": "No dead-end activities",
+      "level": "basic",
+      "priority": "must",
+      "guideline": "Every non-end step must lead to another step or branch.",
+      "rationale": "Dead ends indicate incomplete process logic."
+    },
+    {
+      "id": "ins_011",
+      "category": "quality",
+      "title": "Use short and unique labels",
+      "level": "basic",
+      "priority": "should",
+      "guideline": "Prefer concise labels (up to 3 words) and avoid duplicate tasks with identical role and meaning.",
+      "rationale": "Compact unique naming keeps the model compact and easier to parse."
+    },
+    {
+      "id": "ins_012",
+      "category": "timers",
+      "title": "Boundary timers need explicit target",
+      "level": "advanced",
+      "priority": "must",
+      "guideline": "Each boundary timer must define where the flow continues.",
+      "rationale": "Timer semantics are invalid without continuation target."
+    }
+  ],
+  "antiPatterns": [
+    {
+      "id": "anti_001",
+      "name": "Gateway with one outgoing path",
+      "whyItIsBad": "Adds visual complexity without decision semantics.",
+      "fix": "Replace with direct sequence flow from predecessor to successor."
+    },
+    {
+      "id": "anti_002",
+      "name": "Unlabeled gateway branches",
+      "whyItIsBad": "Readers cannot infer business intent.",
+      "fix": "Add branch conditions with explicit wording, ideally Ja/Nein."
+    },
+    {
+      "id": "anti_003",
+      "name": "Cross-lane activity ownership ambiguity",
+      "whyItIsBad": "Responsibility becomes unclear.",
+      "fix": "Ensure each step has one role and is rendered in the matching lane."
+    },
+    {
+      "id": "anti_004",
+      "name": "Excessive back loops",
+      "whyItIsBad": "Reduces readability and creates routing clutter.",
+      "fix": "Use explicit correction loops and isolate return paths."
+    }
+  ],
+  "qualityChecklist": [
+    "At least one start event and one end event exist.",
+    "Each non-end node has outgoing flow.",
+    "Each sequence flow target exists.",
+    "Each gateway has two or more meaningful branches.",
+    "Branch labels are explicit and normalized.",
+    "No duplicate step IDs.",
+    "No non-endpoint line crossings in lane area.",
+    "Main path stays near lane center for readability."
+  ]
+}

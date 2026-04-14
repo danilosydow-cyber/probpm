@@ -11,6 +11,18 @@ function normalizeRoleName(value) {
     return compactLabel(value, 3);
 }
 
+function classifyConditionLabel(label) {
+    const value = String(label || "").trim().toLowerCase();
+    if (!value) return "other";
+    const hasNegation = /\b(nicht|kein|keine|ohne|un|inaktiv|ungueltig|ungültig)\b/i.test(value);
+    if (/\b(nicht\s+genehmigt|nicht\s+freigegeben|nicht\s+ok|not\s+approved)\b/i.test(value)) return "no";
+    if (/\b(nicht\s+abgelehnt|not\s+rejected)\b/i.test(value)) return "yes";
+    if (/(^|\b)(ja|yes|ok|true|freigabe|genehmigt)(\b|$)/i.test(value)) return "yes";
+    if (/(^|\b)(nein|no|false|abgelehnt)(\b|$)/i.test(value)) return "no";
+    if (hasNegation) return "no";
+    return "other";
+}
+
 function buildConsistentRoles(json) {
     const knownRoles = [];
     const roleIndex = new Map();
@@ -301,8 +313,176 @@ function normalizeAnnotationsBlock(json) {
         });
 }
 
+function applyBpmnStandards(json) {
+    const steps = Array.isArray(json.steps) ? json.steps : [];
+    const validIds = new Set(steps.map((s) => s?.id).filter(Boolean));
+
+    // Canonicalize step types and keep end events terminal.
+    steps.forEach((step) => {
+        const t = String(step?.type || "").trim().toLowerCase();
+        if (t === "gateway") step.type = "gateway";
+        else if (t === "end" || t === "endevent") step.type = "end";
+        else step.type = "task";
+
+        if (step.type === "end") {
+            step.next = [];
+            step.conditions = [];
+            delete step.taskKind;
+            delete step.email;
+            delete step.boundaryTimers;
+            delete step.documentation;
+        }
+    });
+
+    let syntheticCounter = 1;
+    const nextSyntheticEndId = () => {
+        let id = `step_end_auto_${syntheticCounter}`;
+        while (validIds.has(id)) {
+            syntheticCounter += 1;
+            id = `step_end_auto_${syntheticCounter}`;
+        }
+        syntheticCounter += 1;
+        validIds.add(id);
+        return id;
+    };
+
+    const ensureEndForStep = (sourceStep, mode = "task") => {
+        const endId = nextSyntheticEndId();
+        steps.push({
+            id: endId,
+            type: "end",
+            label: "Ende",
+            role: sourceStep.role
+        });
+        if (mode === "gateway") {
+            sourceStep.conditions = [
+                ...(Array.isArray(sourceStep.conditions) ? sourceStep.conditions : []),
+                { label: "Weiter", target: endId }
+            ];
+        } else {
+            sourceStep.next = [endId];
+        }
+    };
+
+    steps.forEach((step) => {
+        if (step.type === "gateway") {
+            const conditions = Array.isArray(step.conditions) ? step.conditions : [];
+            const deduped = [];
+            const seenTargets = new Set();
+            conditions.forEach((cond) => {
+                const target = cond?.target;
+                if (typeof target !== "string" || !validIds.has(target)) return;
+                if (target === step.id || seenTargets.has(target)) return;
+                seenTargets.add(target);
+                deduped.push({
+                    label: compactLabel(cond?.label || "Bedingung", 2),
+                    target
+                });
+            });
+
+            if (deduped.length === 2) {
+                const firstKind = classifyConditionLabel(deduped[0].label);
+                const secondKind = classifyConditionLabel(deduped[1].label);
+                if (firstKind === "other" && secondKind === "other") {
+                    deduped[0].label = "Ja";
+                    deduped[1].label = "Nein";
+                }
+            }
+            step.next = [];
+            step.conditions = deduped;
+            if (step.conditions.length === 0) {
+                ensureEndForStep(step, "gateway");
+            }
+        }
+    });
+
+    steps.forEach((step) => {
+        if (step.type === "end") return;
+        const hasNext = Array.isArray(step.next) && step.next.length > 0;
+        const hasConditions = Array.isArray(step.conditions) && step.conditions.length > 0;
+        if (!hasNext && !hasConditions) {
+            ensureEndForStep(step, step.type === "gateway" ? "gateway" : "task");
+        }
+    });
+
+    if (!steps.some((step) => step.type === "end")) {
+        const fallbackRole = json.roles?.[0] || "System";
+        steps.push({
+            id: nextSyntheticEndId(),
+            type: "end",
+            label: "Ende",
+            role: fallbackRole
+        });
+    }
+
+    json.steps = steps;
+}
+
+function applyCorrectionLoopHeuristics(json) {
+    const steps = Array.isArray(json.steps) ? json.steps : [];
+    if (steps.length === 0) return;
+    const byId = new Map(steps.map((step) => [step.id, step]));
+    const correctionRegex = /(korrig|korrektur|nacharbeit|nachbearbeit|klaer|klär|fehlerbeheb)/i;
+    const checkRegex = /(pruef|prüf|validier|bewert|kontroll|review)/i;
+    const completionRegex = /(abschluss|beend|ende|kommuniz|informier|versend)/i;
+
+    const findNearestCheckBefore = (gatewayIndex) => {
+        for (let i = gatewayIndex - 1; i >= 0; i -= 1) {
+            const step = steps[i];
+            if (!step || step.type !== "task") continue;
+            const label = String(step.label || "");
+            if (checkRegex.test(label)) return step;
+        }
+        return null;
+    };
+
+    steps.forEach((step, gatewayIndex) => {
+        if (step.type !== "gateway") return;
+        const conditions = Array.isArray(step.conditions) ? step.conditions : [];
+        if (conditions.length < 2) return;
+
+        const yesCond = conditions.find((cond) => classifyConditionLabel(cond?.label) === "yes");
+        const noCond = conditions.find((cond) => classifyConditionLabel(cond?.label) === "no");
+        if (!yesCond || !noCond) return;
+
+        const yesTarget = byId.get(yesCond.target);
+        const noTarget = byId.get(noCond.target);
+        const yesIsCorrection = correctionRegex.test(String(yesTarget?.label || ""));
+        const noIsCorrection = correctionRegex.test(String(noTarget?.label || ""));
+        const yesLooksCompletion = completionRegex.test(String(yesTarget?.label || ""));
+        const noLooksCompletion = completionRegex.test(String(noTarget?.label || ""));
+
+        // Swap only with strong evidence to avoid damaging valid special cases.
+        const highEvidenceSwap =
+            yesIsCorrection
+            && !noIsCorrection
+            && (noLooksCompletion || yesTarget?.type === "task");
+        if (highEvidenceSwap) {
+            const temp = yesCond.target;
+            yesCond.target = noCond.target;
+            noCond.target = temp;
+        }
+
+        const correctedNoTarget = byId.get(noCond.target);
+        const noStillCorrection = correctionRegex.test(String(correctedNoTarget?.label || ""));
+        if (!noStillCorrection || correctedNoTarget?.type !== "task") return;
+
+        const nearestCheck = findNearestCheckBefore(gatewayIndex);
+        if (!nearestCheck?.id) return;
+        if (completionRegex.test(String(nearestCheck?.label || ""))) return;
+
+        // Enforce local correction loop to the nearest relevant check/validation step.
+        correctedNoTarget.next = [nearestCheck.id];
+        correctedNoTarget.conditions = [];
+    });
+}
+
 export function normalizeProcessJson(processJson) {
     const normalized = JSON.parse(JSON.stringify(processJson));
+    const semanticSteps = Array.isArray(normalized?._semanticIR?.steps) ? normalized._semanticIR.steps : [];
+    const semanticById = new Map(semanticSteps.map((step) => [step?.id, step]));
+    const processFlags = Array.isArray(normalized?._semanticIR?.processFlags) ? normalized._semanticIR.processFlags : [];
+    const topLevelAmbiguity = Array.isArray(normalized?._ambiguityFlags) ? normalized._ambiguityFlags : [];
 
     normalized.steps = (normalized.steps || []).map((step) => {
         const type = step?.type === "start" || step?.type === "startEvent" ? "task" : step?.type;
@@ -312,17 +492,31 @@ export function normalizeProcessJson(processJson) {
     normalized.roles = (normalized.roles || []).map((role) => compactLabel(role, 3) || "Rolle");
 
     normalized.steps = (normalized.steps || []).map((step, index) => {
+        const semantic = semanticById.get(step?.id) || {};
         const t = String(step?.type || "").toLowerCase();
         const isActivity = t !== "gateway" && t !== "end" && t !== "endevent";
         const nextStep = {
             ...step,
-            label: compactLabel(step?.label, 3) || `Schritt ${index + 1}`
+            role: semantic?.role || step?.role,
+            label: compactLabel(step?.label || semantic?.activity, 3) || `Schritt ${index + 1}`
         };
+        if (Array.isArray(semantic?.dependsOn) && semantic.dependsOn.length > 0) {
+            nextStep._dependsOn = semantic.dependsOn.filter((id) => typeof id === "string");
+        }
+        if (Array.isArray(semantic?.ambiguityFlags) && semantic.ambiguityFlags.length > 0) {
+            nextStep._ambiguityFlags = [...new Set(semantic.ambiguityFlags)];
+        }
+        if (semantic?.statusHint) {
+            nextStep._statusHint = String(semantic.statusHint);
+        }
         if (isActivity) {
             nextStep.taskKind = sanitizeTaskKind(step?.taskKind);
             const doc = typeof step?.documentation === "string" ? step.documentation.trim() : "";
+            const semanticDoc = semantic?.statusHint ? `Statushinweis: ${semantic.statusHint}` : "";
             if (doc) {
-                nextStep.documentation = doc.slice(0, 2000);
+                nextStep.documentation = `${doc}${semanticDoc ? `\n${semanticDoc}` : ""}`.slice(0, 2000);
+            } else if (semanticDoc) {
+                nextStep.documentation = semanticDoc;
             } else {
                 delete nextStep.documentation;
             }
@@ -342,6 +536,9 @@ export function normalizeProcessJson(processJson) {
     buildConsistentRoles(normalized);
     mergeDuplicateTasksByLabel(normalized);
     removeTransitiveDirectEdges(normalized);
+    applyBpmnStandards(normalized);
+    applyCorrectionLoopHeuristics(normalized);
+    normalizeConnections(normalized);
 
     const validIdsAfter = new Set(normalized.steps.map((s) => s?.id).filter(Boolean));
     normalized.steps = normalized.steps.map((step) => {
@@ -351,5 +548,11 @@ export function normalizeProcessJson(processJson) {
     });
 
     normalizeAnnotationsBlock(normalized);
+    normalized.analysisMeta = {
+        ambiguityFlags: [...new Set([...processFlags, ...topLevelAmbiguity])],
+        semanticVersion: normalized?._semanticIR?.version || "none"
+    };
+    delete normalized._semanticIR;
+    delete normalized._ambiguityFlags;
     return normalized;
 }
