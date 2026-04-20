@@ -835,30 +835,53 @@ function routeFlow(
         ];
     }
 
-    // Loop/back edge: route via outer left/top corridor to avoid core clutter.
+    // Loop/back edge: keep loops compact and separated near involved lanes.
     if (isLoop) {
         const loopTrack = corridorState.loop ?? 0;
         corridorState.loop = loopTrack + 1;
         const level = Math.floor(loopTrack / 2) + 1;
-        const leftMin = snap((laneBounds.minX ?? 50) + 12);
-        const leftMax = snap((laneBounds.minX ?? 50) + 120);
-        const topMin = snap((laneBounds.minY ?? 50) + 12);
-        const topMax = snap((laneBounds.minY ?? 50) + 108);
-        const desiredLeftRail = snap(Math.min(startX, endX) - (72 + level * 24));
-        const desiredTopRail = snap(Math.min(startY, endY) - (36 + level * 18));
-        const leftRailX = Math.max(leftMin, Math.min(leftMax, desiredLeftRail));
-        const topRailY = Math.max(topMin, Math.min(topMax, desiredTopRail));
+        const fromLane = fromStep?._roleId ? laneMeta?.[fromStep._roleId] : null;
+        const toLane = toStep?._roleId ? laneMeta?.[toStep._roleId] : null;
+        const localMinY = Math.min(fromLane?.y ?? laneBounds.minY, toLane?.y ?? laneBounds.minY);
+        const localMaxY = Math.max(
+            (fromLane?.y ?? laneBounds.maxY) + (fromLane?.height ?? 0),
+            (toLane?.y ?? laneBounds.maxY) + (toLane?.height ?? 0)
+        );
+        const localMinX = Math.min(startX, endX);
+        const localMaxX = Math.max(startX, endX);
+        // Adaptive loop density:
+        // keep loops compact for small counts, but spread them progressively
+        // when multiple loop edges share the same area.
+        const densityPhase = loopTrack < 2 ? 0 : loopTrack < 5 ? 1 : 2;
+        const levelStep = densityPhase === 0 ? 10 : densityPhase === 1 ? 14 : 18;
+        const laneInset = densityPhase === 0 ? 24 : 18;
+        const bottomBand = snap(localMaxY - laneInset - level * levelStep);
+        const preferredUnderAxis = snap(Math.max(startY, endY) + 36 + level * levelStep);
+        const maxInsideLane = snap(localMaxY - 12);
+        const loopY = snap(Math.min(maxInsideLane, Math.max(bottomBand, preferredUnderAxis)));
+        const railSpread = densityPhase === 0 ? 14 : densityPhase === 1 ? 18 : 24;
+        const desiredRailX = Math.max(startX + 36, localMaxX + 36 + level * railSpread);
+        const maxRailX = strictQuality ? laneBounds.maxX + 48 : laneBounds.maxX + 132;
+        const rightRailX = snap(Math.min(maxRailX, desiredRailX));
         const exitX = snap(startX + 24);
-        const entryX = snap(endX - 24);
-        return [
+        const targetCenterX = to.x + toSize.width / 2;
+        const targetAnchorY = to.y + toSize.height;
+        const entryRailOffset = (loopTrack % 2 === 0 ? -1 : 1) * Math.max(12, level * 6);
+        const entryX = snap(targetCenterX + entryRailOffset);
+
+        const loopPoints = [
             { x: snap(startX), y: snap(startY) },
             { x: exitX, y: snap(startY) },
-            { x: leftRailX, y: snap(startY) },
-            { x: leftRailX, y: topRailY },
-            { x: entryX, y: topRailY },
-            { x: entryX, y: snap(endY) },
-            { x: snap(endX), y: snap(endY) }
+            { x: rightRailX, y: snap(startY) },
+            { x: rightRailX, y: loopY },
+            { x: entryX, y: loopY },
+            { x: entryX, y: snap(targetAnchorY) }
         ];
+        return loopPoints.filter((point, idx, arr) => {
+            if (idx === 0) return true;
+            const prev = arr[idx - 1];
+            return point.x !== prev.x || point.y !== prev.y;
+        });
     }
 
     // Design-Regel 2: Gateway-Ausgangsflüsse müssen rechts, oberhalb oder unterhalb des Gateways verlaufen
@@ -1685,18 +1708,6 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions, laneMe
 
         const fromSize = getNodeSize(fromStep);
         const toSize = getNodeSize(toStep);
-        const isActivityLikeSource = (
-            fromStep.type === "task"
-            || fromStep.type === "subprocess"
-            || fromStep.type === "subProcess"
-            || fromStep.type === "callActivity"
-        );
-        const isActivityLikeTarget = (
-            toStep.type === "task"
-            || toStep.type === "subprocess"
-            || toStep.type === "subProcess"
-            || toStep.type === "callActivity"
-        );
         const outgoingMeta = outgoingIndexMeta?.get(index) || { localIndex: 0, isPrimary: false };
         const branchKind = classifyBranchLabel(flow.condition);
         const preferYesAsMain = shouldPreferYesAsMainExit(fromStep, flow, flows);
@@ -1729,11 +1740,9 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions, laneMe
             y: Math.round(fromPos.y + fromSize.height / 2)
         };
         const inMeta = incomingIndex.get(index) || { localIndex: 0, total: 1 };
-        const targetAnchorY = isActivityLikeTarget
+        const targetAnchorY = inMeta.total <= 1
             ? (toPos.y + toSize.height / 2)
-            : (inMeta.total <= 1
-                ? (toPos.y + toSize.height / 2)
-                : (toPos.y + ((inMeta.localIndex + 1) * toSize.height) / (inMeta.total + 1)));
+            : (toPos.y + ((inMeta.localIndex + 1) * toSize.height) / (inMeta.total + 1));
         const isLoop = Boolean(flow._isBackEdge);
         const targetCenterX = toPos.x + toSize.width / 2;
         const end = isLoop
@@ -1745,23 +1754,6 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions, laneMe
                 x: Math.round(toPos.x),
                 y: Math.round(toStep.type === "endEvent" ? (toPos.y + toSize.height / 2) : targetAnchorY)
             };
-
-        // Phase 2 hard rule:
-        // after all shapes are placed, connect activities with clean right->left middle anchors.
-        if (!isLoop && isActivityLikeSource) {
-            const startPoint = { x: snap(start.x), y: snap(start.y) };
-            const endPoint = { x: snap(end.x), y: snap(end.y) };
-            if (startPoint.y === endPoint.y) {
-                return [startPoint, endPoint];
-            }
-            const corridorX = snap(Math.max(startPoint.x + 24, endPoint.x - 24));
-            return [
-                startPoint,
-                { x: corridorX, y: startPoint.y },
-                { x: corridorX, y: endPoint.y },
-                endPoint
-            ];
-        }
 
         const safe = Array.isArray(points) ? points.map((p) => ({ ...p })) : [];
         if (safe.length < 2) {
@@ -1811,13 +1803,6 @@ function enforceFlowEndpoints(flowWaypoints, flows, stepsById, positions, laneMe
             const nearEnd = safe[safe.length - 2];
             if (nearEnd.y !== last.y || nearEnd.x !== loopRailX) {
                 safe.splice(safe.length - 1, 0, { x: loopRailX, y: last.y });
-            }
-        } else if (isActivityLikeTarget && !isLoop && prev && last) {
-            const entryX = snap(Math.max(fromPos.x + fromSize.width + 12, toPos.x - 24));
-            if (prev.y !== last.y || prev.x >= last.x) {
-                safe.splice(safe.length - 1, 0, { x: entryX, y: last.y });
-            } else if (prev.x > entryX) {
-                safe.splice(safe.length - 1, 0, { x: entryX, y: last.y });
             }
         } else if (prev && last && prev.x !== last.x && prev.y !== last.y) {
             safe.splice(safe.length - 1, 0, { x: last.x, y: prev.y });
@@ -2028,18 +2013,6 @@ export function generateBPMN(process, options = {}) {
         flows.unshift({ from: startId, to: step.id });
     });
     let normalizedFlows = dedupeFlows(flows);
-    const isActivityLikeForStart = (step) => (
-        step?.type === "task"
-        || step?.type === "subprocess"
-        || step?.type === "subProcess"
-        || step?.type === "callActivity"
-    );
-    const firstActivityStep = steps.find((step) => isActivityLikeForStart(step));
-    if (firstActivityStep?.id) {
-        // Hard rule: start event always connects to the first activity.
-        normalizedFlows = normalizedFlows.filter((flow) => flow.from !== startId);
-        normalizedFlows.unshift({ from: startId, to: firstActivityStep.id });
-    }
 
     const roleMap = {};
     roles.forEach((role, i) => {
@@ -2133,9 +2106,6 @@ export function generateBPMN(process, options = {}) {
 
     const positions = {};
     const laneMeta = {};
-    // Two-phase layout: place all role/activity/gateway/event shapes first,
-    // then connect them with sequence flows in a separate pass.
-    const connectFlowsAfterShapePlacement = true;
     const STEP_SLOT = 84;
     const LANE_BRANCH_OFFSET = 72;
     const LANE_PADDING = 16;
@@ -2262,98 +2232,94 @@ export function generateBPMN(process, options = {}) {
         };
     });
 
-    const longestPathToEnd = computeLongestPathToEnd(steps, normalizedFlows);
-    if (!connectFlowsAfterShapePlacement) {
-        // Keep simple same-role chains visually straight on one axis.
-        const incomingCount = new Map();
-        const outgoingCount = new Map();
+    // Keep simple same-role chains visually straight on one axis.
+    const incomingCount = new Map();
+    const outgoingCount = new Map();
+    normalizedFlows.forEach((flow) => {
+        incomingCount.set(flow.to, (incomingCount.get(flow.to) || 0) + 1);
+        outgoingCount.set(flow.from, (outgoingCount.get(flow.from) || 0) + 1);
+    });
+    for (let pass = 0; pass < 3; pass += 1) {
+        let changed = false;
         normalizedFlows.forEach((flow) => {
-            incomingCount.set(flow.to, (incomingCount.get(flow.to) || 0) + 1);
-            outgoingCount.set(flow.from, (outgoingCount.get(flow.from) || 0) + 1);
-        });
-        for (let pass = 0; pass < 3; pass += 1) {
-            let changed = false;
-            normalizedFlows.forEach((flow) => {
-                const fromStep = stepById.get(flow.from);
-                const toStep = stepById.get(flow.to);
-                if (!fromStep || !toStep) return;
-                if (fromStep.type === "gateway") return;
-                if (fromStep._roleId !== toStep._roleId) return;
-                if ((outgoingCount.get(flow.from) || 0) !== 1) return;
-                if ((incomingCount.get(flow.to) || 0) !== 1) return;
-                if (toStep._isMain) return;
-
-                const fromPos = positions[flow.from];
-                const toPos = positions[flow.to];
-                const fromSize = getNodeSize(fromStep);
-                const toSize = getNodeSize(toStep);
-                const fromCenter = fromPos.y + fromSize.height / 2;
-                const targetY = snap(fromCenter - toSize.height / 2);
-                if (toPos.y !== targetY) {
-                    toPos.y = targetY;
-                    changed = true;
-                }
-            });
-            if (!changed) break;
-        }
-
-        // Keep primary forward branch on source row when a split exists in same role.
-        const outgoingMetaByFlow = buildOutgoingIndex(normalizedFlows, positions, stepById, longestPathToEnd);
-        normalizedFlows.forEach((flow, flowIndex) => {
-            const meta = outgoingMetaByFlow.get(flowIndex) || { localIndex: 0, total: 1 };
-            if (meta.total <= 1 || meta.localIndex !== 0) return;
             const fromStep = stepById.get(flow.from);
             const toStep = stepById.get(flow.to);
             if (!fromStep || !toStep) return;
             if (fromStep.type === "gateway") return;
-            if (toStep._isMain) return;
             if (fromStep._roleId !== toStep._roleId) return;
+            if ((outgoingCount.get(flow.from) || 0) !== 1) return;
+            if ((incomingCount.get(flow.to) || 0) !== 1) return;
+            if (toStep._isMain) return;
 
             const fromPos = positions[flow.from];
             const toPos = positions[flow.to];
             const fromSize = getNodeSize(fromStep);
             const toSize = getNodeSize(toStep);
-            const lane = laneMeta[toStep._roleId];
-            const sourceCenterY = fromPos.y + fromSize.height / 2;
-            const minY = lane.y + LANE_PADDING;
-            const maxY = lane.y + lane.height - LANE_PADDING - toSize.height;
-            toPos.y = snap(Math.max(minY, Math.min(maxY, sourceCenterY - toSize.height / 2)));
+            const fromCenter = fromPos.y + fromSize.height / 2;
+            const targetY = snap(fromCenter - toSize.height / 2);
+            if (toPos.y !== targetY) {
+                toPos.y = targetY;
+                changed = true;
+            }
         });
-
-        // Explicitly align forward Task->Gateway edges on the same Y axis
-        // even when gateway has additional incoming loop edges.
-        normalizedFlows.forEach((flow) => {
-            const fromStep = stepById.get(flow.from);
-            const toStep = stepById.get(flow.to);
-            if (!fromStep || !toStep) return;
-            if (fromStep.type === "gateway" || toStep.type !== "gateway") return;
-            if (toStep._isMain) return;
-            if (fromStep._roleId !== toStep._roleId) return;
-
-            const fromPos = positions[flow.from];
-            const toPos = positions[flow.to];
-            const fromSize = getNodeSize(fromStep);
-            const toSize = getNodeSize(toStep);
-            const startX = fromPos.x + fromSize.width;
-            const endX = toPos.x;
-            if (endX <= startX) return;
-
-            const lane = laneMeta[toStep._roleId];
-            const sourceCenterY = fromPos.y + fromSize.height / 2;
-            const minY = lane.y + LANE_PADDING;
-            const maxY = lane.y + lane.height - LANE_PADDING - toSize.height;
-            toPos.y = snap(Math.max(minY, Math.min(maxY, sourceCenterY - toSize.height / 2)));
-        });
+        if (!changed) break;
     }
+
+    // Keep primary forward branch on source row when a split exists in same role.
+    const longestPathToEnd = computeLongestPathToEnd(steps, normalizedFlows);
+    const outgoingMetaByFlow = buildOutgoingIndex(normalizedFlows, positions, stepById, longestPathToEnd);
+    normalizedFlows.forEach((flow, flowIndex) => {
+        const meta = outgoingMetaByFlow.get(flowIndex) || { localIndex: 0, total: 1 };
+        if (meta.total <= 1 || meta.localIndex !== 0) return;
+        const fromStep = stepById.get(flow.from);
+        const toStep = stepById.get(flow.to);
+        if (!fromStep || !toStep) return;
+        if (fromStep.type === "gateway") return;
+        if (toStep._isMain) return;
+        if (fromStep._roleId !== toStep._roleId) return;
+
+        const fromPos = positions[flow.from];
+        const toPos = positions[flow.to];
+        const fromSize = getNodeSize(fromStep);
+        const toSize = getNodeSize(toStep);
+        const lane = laneMeta[toStep._roleId];
+        const sourceCenterY = fromPos.y + fromSize.height / 2;
+        const minY = lane.y + LANE_PADDING;
+        const maxY = lane.y + lane.height - LANE_PADDING - toSize.height;
+        toPos.y = snap(Math.max(minY, Math.min(maxY, sourceCenterY - toSize.height / 2)));
+    });
+
+    // Explicitly align forward Task->Gateway edges on the same Y axis
+    // even when gateway has additional incoming loop edges.
+    normalizedFlows.forEach((flow) => {
+        const fromStep = stepById.get(flow.from);
+        const toStep = stepById.get(flow.to);
+        if (!fromStep || !toStep) return;
+        if (fromStep.type === "gateway" || toStep.type !== "gateway") return;
+        if (toStep._isMain) return;
+        if (fromStep._roleId !== toStep._roleId) return;
+
+        const fromPos = positions[flow.from];
+        const toPos = positions[flow.to];
+        const fromSize = getNodeSize(fromStep);
+        const toSize = getNodeSize(toStep);
+        const startX = fromPos.x + fromSize.width;
+        const endX = toPos.x;
+        if (endX <= startX) return;
+
+        const lane = laneMeta[toStep._roleId];
+        const sourceCenterY = fromPos.y + fromSize.height / 2;
+        const minY = lane.y + LANE_PADDING;
+        const maxY = lane.y + lane.height - LANE_PADDING - toSize.height;
+        toPos.y = snap(Math.max(minY, Math.min(maxY, sourceCenterY - toSize.height / 2)));
+    });
 
     // Reuse the relayout strategy from the editor button:
     // resolve shape overlaps inside each lane before edge routing.
     resolveLaneNodeOverlaps(steps, positions, laneMeta, LANE_PADDING);
 
     // Neue Kreuzungsvermeidung: Versuche, Flow-Kreuzungen zu reduzieren
-    if (!connectFlowsAfterShapePlacement) {
-        detectAndReduceFlowCrossings(normalizedFlows, positions, steps, laneMeta);
-    }
+    detectAndReduceFlowCrossings(normalizedFlows, positions, steps, laneMeta);
 
     const firstFlow = normalizedFlows.find((flow) => flow.from === startId);
     if (firstFlow && positions[firstFlow.to]) {
@@ -2422,166 +2388,25 @@ export function generateBPMN(process, options = {}) {
     compactLaneHorizontalGaps(steps, positions, normalizedFlows, laneMeta);
 
     // Keep gateway successors from collapsing onto the split point.
-    if (!connectFlowsAfterShapePlacement) {
-        for (let pass = 0; pass < 3; pass += 1) {
-            let moved = false;
-            normalizedFlows.forEach((flow) => {
-                const fromStep = stepById.get(flow.from);
-                const toStep = stepById.get(flow.to);
-                if (!fromStep || !toStep || fromStep.type !== "gateway") return;
-                const fromPos = positions[flow.from];
-                const toPos = positions[flow.to];
-                if (!fromPos || !toPos) return;
-                const fromSize = getNodeSize(fromStep);
-                const minGap = 84;
-                const minTargetX = snap(fromPos.x + fromSize.width + minGap);
-                if (toPos.x < minTargetX) {
-                    toPos.x = minTargetX;
-                    moved = true;
-                }
-            });
-            if (!moved) break;
-        }
-    }
-
-    // Enforce gateway ordering: gateway must be positioned after preceding activities.
-    const isActivityLikeNode = (step) => (
-        step?.type === "task"
-        || step?.type === "subprocess"
-        || step?.type === "subProcess"
-        || step?.type === "callActivity"
-    );
     for (let pass = 0; pass < 3; pass += 1) {
-        let movedGateway = false;
-        steps.forEach((step) => {
-            if (step?.type !== "gateway") return;
-            const gatewayPos = positions[step.id];
-            if (!gatewayPos) return;
-            let requiredMinX = gatewayPos.x;
-            normalizedFlows.forEach((flow) => {
-                if (flow.to !== step.id) return;
-                const predecessor = stepById.get(flow.from);
-                if (!isActivityLikeNode(predecessor)) return;
-                const predecessorPos = positions[flow.from];
-                if (!predecessorPos) return;
-                const predecessorSize = getNodeSize(predecessor);
-                requiredMinX = Math.max(requiredMinX, predecessorPos.x + predecessorSize.width + 72);
-            });
-            const snappedRequired = snap(requiredMinX);
-            if (gatewayPos.x < snappedRequired) {
-                gatewayPos.x = snappedRequired;
-                movedGateway = true;
+        let moved = false;
+        normalizedFlows.forEach((flow) => {
+            const fromStep = stepById.get(flow.from);
+            const toStep = stepById.get(flow.to);
+            if (!fromStep || !toStep || fromStep.type !== "gateway") return;
+            const fromPos = positions[flow.from];
+            const toPos = positions[flow.to];
+            if (!fromPos || !toPos) return;
+            const fromSize = getNodeSize(fromStep);
+            const minGap = 84;
+            const minTargetX = snap(fromPos.x + fromSize.width + minGap);
+            if (toPos.x < minTargetX) {
+                toPos.x = minTargetX;
+                moved = true;
             }
         });
-        if (!movedGateway) break;
+        if (!moved) break;
     }
-
-    // Enforce requested activity placement order:
-    // 1) first activity right of start event
-    // 2) next activity right of previous when same responsibility
-    // 3) on responsibility change place next activity above/below previous (vertical relation)
-    const ACTIVITY_SEQUENCE_GAP = 36;
-    const mainPathActivities = mainPath
-        .map((stepId) => stepById.get(stepId))
-        .filter((step) => isActivityLikeNode(step));
-    if (mainPathActivities.length > 0) {
-        const startStep = stepById.get(startId);
-        const startPos = positions[startId];
-        const firstActivity = mainPathActivities[0];
-        const firstPos = firstActivity ? positions[firstActivity.id] : null;
-        if (startStep && startPos && firstActivity && firstPos) {
-            const startSize = getNodeSize(startStep);
-            const requiredFirstX = snap(startPos.x + startSize.width + ACTIVITY_SEQUENCE_GAP);
-            firstPos.x = requiredFirstX;
-        }
-    }
-
-    for (let idx = 1; idx < mainPathActivities.length; idx += 1) {
-        const prevStep = mainPathActivities[idx - 1];
-        const currentStep = mainPathActivities[idx];
-        const prevPos = positions[prevStep.id];
-        const currentPos = positions[currentStep.id];
-        if (!prevPos || !currentPos) continue;
-
-        const prevSize = getNodeSize(prevStep);
-        const currentSize = getNodeSize(currentStep);
-        // Follow activity is always placed to the right with a small gap,
-        // also when responsibility changes.
-        currentPos.x = snap(prevPos.x + prevSize.width + ACTIVITY_SEQUENCE_GAP);
-        const prevLane = laneMeta[prevStep._roleId];
-        const targetLane = laneMeta[currentStep._roleId];
-        if (!targetLane) continue;
-        const targetMinY = targetLane.y + LANE_PADDING;
-        const targetMaxY = targetLane.y + targetLane.height - LANE_PADDING - currentSize.height;
-        const prevCenterY = prevPos.y + prevSize.height / 2;
-        const targetCenterY = targetLane.y + targetLane.height / 2;
-        const sameResponsibility = prevStep._roleId === currentStep._roleId;
-        const preferredY = sameResponsibility
-            ? prevPos.y
-            : snap(targetCenterY - currentSize.height / 2);
-        currentPos.y = snap(Math.max(targetMinY, Math.min(targetMaxY, preferredY)));
-    }
-
-    // Gateway -> activity placement:
-    // place successor right / above / below depending on branch start direction.
-    const GATEWAY_TO_ACTIVITY_GAP_X = 48;
-    const GATEWAY_TO_ACTIVITY_GAP_Y = 24;
-    const gatewayToActivities = new Map();
-    normalizedFlows.forEach((flow) => {
-        const fromStep = stepById.get(flow.from);
-        const toStep = stepById.get(flow.to);
-        if (fromStep?.type !== "gateway" || !isActivityLikeNode(toStep)) return;
-        const fromRank = Number(rank[flow.from] ?? 0);
-        const toRank = Number(rank[flow.to] ?? 0);
-        if (toRank <= fromRank) return;
-        const list = gatewayToActivities.get(flow.from) || [];
-        list.push({ flow, toStep });
-        gatewayToActivities.set(flow.from, list);
-    });
-
-    gatewayToActivities.forEach((targets, gatewayId) => {
-        const gatewayPos = positions[gatewayId];
-        const gatewayStep = stepById.get(gatewayId);
-        if (!gatewayPos || !gatewayStep || targets.length === 0) return;
-        const gatewaySize = getNodeSize(gatewayStep);
-        const gatewayCenterY = gatewayPos.y + gatewaySize.height / 2;
-
-        // For 2+ successors enforce distinct placement around gateway:
-        // one right, one top, one bottom (then alternate top/bottom).
-        const sorted = [...targets].sort((a, b) => {
-            const posA = positions[a.flow.to];
-            const posB = positions[b.flow.to];
-            const yA = posA ? posA.y : 0;
-            const yB = posB ? posB.y : 0;
-            return yA - yB;
-        });
-        const slotOrder = ["right", "top", "bottom"];
-        sorted.forEach((entry, idx) => {
-            const toPos = positions[entry.flow.to];
-            if (!toPos) return;
-            const toSize = getNodeSize(entry.toStep);
-            const lane = laneMeta[entry.toStep._roleId];
-            const minY = lane ? lane.y + LANE_PADDING : toPos.y;
-            const maxY = lane ? lane.y + lane.height - LANE_PADDING - toSize.height : toPos.y;
-            const rightX = snap(gatewayPos.x + gatewaySize.width + GATEWAY_TO_ACTIVITY_GAP_X);
-            const centeredX = snap(gatewayPos.x + gatewaySize.width / 2 - toSize.width / 2);
-            const slot = targets.length >= 2
-                ? (idx < slotOrder.length ? slotOrder[idx] : (idx % 2 === 0 ? "top" : "bottom"))
-                : "right";
-
-            if (slot === "right") {
-                toPos.x = rightX;
-                toPos.y = snap(Math.max(minY, Math.min(maxY, gatewayCenterY - toSize.height / 2)));
-                return;
-            }
-            // For top/bottom branches, place activity exactly above/below gateway center.
-            toPos.x = centeredX;
-            const preferredY = slot === "top"
-                ? snap(gatewayPos.y - (toSize.height + GATEWAY_TO_ACTIVITY_GAP_Y))
-                : snap(gatewayPos.y + gatewaySize.height + GATEWAY_TO_ACTIVITY_GAP_Y);
-            toPos.y = snap(Math.max(minY, Math.min(maxY, preferredY)));
-        });
-    });
 
     normalizedFlows.forEach((flow) => {
         const fromStep = stepById.get(flow.from);
@@ -2707,25 +2532,7 @@ id="Defs_1">
         }
     });
 
-    const flowElementTypeByIndex = new Map();
     normalizedFlows.forEach((flow, i) => {
-        const fromStep = stepById.get(flow.from);
-        const toStep = stepById.get(flow.to);
-        const isInfoFlow = Boolean(
-            fromStep
-            && toStep
-            && isActivityLikeNode(fromStep)
-            && isActivityLikeNode(toStep)
-            && fromStep._roleId
-            && toStep._roleId
-            && fromStep._roleId !== toStep._roleId
-        );
-        if (isInfoFlow) {
-            flowElementTypeByIndex.set(i, "association");
-            xml += `<bpmn:association id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}" associationDirection="One" />`;
-            return;
-        }
-        flowElementTypeByIndex.set(i, "sequenceFlow");
         const name = flow.condition ? ` name="${escapeXml(flow.condition)}"` : "";
         xml += `<bpmn:sequenceFlow id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}"${name} />`;
     });
@@ -2760,13 +2567,9 @@ id="Defs_1">
         const pos = positions[step.id];
         const { width, height } = getNodeSize(step);
         const labelText = compactLabel(step.label || "undefined", 3);
-        const isGateway = step.type === "gateway";
-        const labelWidth = Math.max(64, Math.min(200, labelText.length * 7));
+        const labelWidth = Math.max(48, Math.min(180, labelText.length * 7));
         const labelX = snap(pos.x + width / 2 - labelWidth / 2);
-        // Keep gateway question label attached and visible near the gateway.
-        const labelY = isGateway
-            ? snap(pos.y + height + 8)
-            : snap(pos.y + height + SHAPE_LABEL_GAP);
+        const labelY = snap(pos.y + height + SHAPE_LABEL_GAP);
         xml += `<bpmndi:BPMNShape bpmnElement="${step.id}"><dc:Bounds x="${pos.x}" y="${pos.y}" width="${width}" height="${height}" /><bpmndi:BPMNLabel><dc:Bounds x="${labelX}" y="${labelY}" width="${labelWidth}" height="18" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>`;
     });
 
@@ -2818,236 +2621,71 @@ id="Defs_1">
         })
     );
 
-    const useHardTwoPhaseActivityAnchors = true;
-    const finalRenderWaypoints = useHardTwoPhaseActivityAnchors
-        ? (() => {
-            const flowMinX = snap((laneBounds.minX ?? LANE_X) + 12);
-            const flowMaxX = snap((laneBounds.maxX ?? (LANE_X + diagramWidth)) - 12);
-            const flowMinY = snap((laneBounds.minY ?? 88) + 12);
-            const flowMaxY = snap((laneBounds.maxY ?? 520) - 12);
-            const clampPoint = (point) => ({
-                x: snap(Math.max(flowMinX, Math.min(flowMaxX, point.x))),
-                y: snap(Math.max(flowMinY, Math.min(flowMaxY, point.y)))
-            });
-            const clampPath = (points) => points.map(clampPoint);
-            const outgoingByGateway = new Map();
-            const isActivityLike = (step) => (
-                step?.type === "task"
-                || step?.type === "subprocess"
-                || step?.type === "subProcess"
-                || step?.type === "callActivity"
-            );
-            normalizedFlows.forEach((flow, idx) => {
-                const source = stepsById.get(flow.from);
-                if (source?.type !== "gateway") return;
-                const list = outgoingByGateway.get(flow.from) || [];
-                list.push({ flow, idx });
-                outgoingByGateway.set(flow.from, list);
-            });
-            const gatewayEdgeByFlowIndex = new Map();
-            outgoingByGateway.forEach((list, gatewayId) => {
-                void gatewayId;
-                const sorted = [...list].sort((a, b) => {
-                    const toA = positions[a.flow.to];
-                    const toB = positions[b.flow.to];
-                    const yA = toA ? toA.y : 0;
-                    const yB = toB ? toB.y : 0;
-                    return yA - yB;
-                });
-                const preferredOrder = ["right", "top", "bottom"];
-                sorted.forEach((entry, localIdx) => {
-                    gatewayEdgeByFlowIndex.set(entry.idx, preferredOrder[Math.min(localIdx, preferredOrder.length - 1)]);
-                });
-            });
-
-            const hardWaypoints = normalizedFlows.map((flow, idx) => {
-                const fromPos = positions[flow.from];
-                const toPos = positions[flow.to];
-                const fromStep = stepsById.get(flow.from);
-                const toStep = stepsById.get(flow.to);
-                if (!fromPos || !toPos || !fromStep || !toStep) return [];
-                const fromSize = getNodeSize(fromStep);
-                const toSize = getNodeSize(toStep);
-                const gatewayOutEdge = gatewayEdgeByFlowIndex.get(idx);
-                const responsibilityChange = fromStep?._roleId && toStep?._roleId && fromStep._roleId !== toStep._roleId;
-                const fromCenterY = fromPos.y + fromSize.height / 2;
-                const toCenterY = toPos.y + toSize.height / 2;
-                const targetIsAbove = toCenterY < fromCenterY - 8;
-                const targetIsBelow = toCenterY > fromCenterY + 8;
-                const verticalTargetEntry = targetIsAbove || targetIsBelow;
-
-                const start = fromStep.type === "gateway"
-                    ? (
-                        gatewayOutEdge === "top"
-                            ? { x: snap(fromPos.x + fromSize.width / 2), y: snap(fromPos.y) }
-                            : gatewayOutEdge === "bottom"
-                                ? { x: snap(fromPos.x + fromSize.width / 2), y: snap(fromPos.y + fromSize.height) }
-                                : { x: snap(fromPos.x + fromSize.width), y: snap(fromPos.y + fromSize.height / 2) }
-                    )
-                    : { x: snap(fromPos.x + fromSize.width), y: snap(fromPos.y + fromSize.height / 2) };
-
-                // Gateway incoming flows must enter from the left edge.
-                const end = toStep.type === "gateway"
-                    ? { x: snap(toPos.x), y: snap(toPos.y + toSize.height / 2) }
-                    : verticalTargetEntry && isActivityLike(toStep)
-                        ? (
-                            targetIsAbove
-                                ? { x: snap(toPos.x + toSize.width / 2), y: snap(toPos.y + toSize.height) } // enter at bottom edge
-                                : { x: snap(toPos.x + toSize.width / 2), y: snap(toPos.y) } // enter at top edge
-                        )
-                    : { x: snap(toPos.x), y: snap(toPos.y + toSize.height / 2) };
-
-                if (fromStep.type === "startEvent" && !Boolean(flow._isBackEdge)) {
-                    if (start.y === end.y) return [start, end];
-                    const startCorridorX = snap(Math.max(start.x + 36, end.x - 24));
-                    return clampPath([
-                        start,
-                        { x: startCorridorX, y: start.y },
-                        { x: startCorridorX, y: end.y },
-                        end
-                    ]);
-                }
-
-                if (fromStep.type === "gateway") {
-                    if (gatewayOutEdge === "top" || gatewayOutEdge === "bottom") {
-                        const dir = gatewayOutEdge === "top" ? -1 : 1;
-                        const exitY = snap(Math.max(flowMinY, Math.min(flowMaxY, start.y + dir * 24)));
-                        const corridorX = snap(Math.max(start.x + 24, end.x - 24));
-                        return clampPath([
-                            start,
-                            { x: start.x, y: exitY },
-                            { x: corridorX, y: exitY },
-                            { x: corridorX, y: end.y },
-                            end
-                        ]);
-                    }
-                    const corridorX = snap(Math.max(start.x + 24, end.x - 24));
-                    if (start.y === end.y) {
-                        return clampPath([start, { x: corridorX, y: start.y }, end]);
-                    }
-                    return clampPath([
-                        start,
-                        { x: corridorX, y: start.y },
-                        { x: corridorX, y: end.y },
-                        end
-                    ]);
-                }
-
-                const isBackLike = Boolean(flow._isBackEdge) || end.x <= start.x + 24;
-                if (isBackLike) {
-                    const railY = snap(Math.max(flowMinY, flowMaxY - 12 - (idx % 6) * 12));
-                    const exitX = snap(start.x + 24);
-                    const entryX = snap(Math.max(laneBounds.minX + 24, end.x - 24));
-                    return clampPath([
-                        start,
-                        { x: exitX, y: start.y },
-                        { x: exitX, y: railY },
-                        { x: entryX, y: railY },
-                        { x: entryX, y: end.y },
-                        end
-                    ]);
-                }
-                if (start.y === end.y) {
-                    return clampPath([start, end]);
-                }
-                const corridorX = snap(Math.max(start.x + 24, end.x - 24));
-                return clampPath([
-                    start,
-                    { x: corridorX, y: start.y },
-                    { x: corridorX, y: end.y },
-                    end
-                ]);
-            });
-
-            const reduced = resolveFlowOverShapeIntersections(
-                hardWaypoints,
-                normalizedFlows,
-                stepRects,
-                laneBounds,
-                stepsById
-            );
-            return enforceOrthogonalWaypoints(reduced, normalizedFlows, stepsById);
-        })()
-        : (() => {
-            let refinedWaypoints = flowWaypoints.map((points) => points.map((p) => ({ ...p })));
-            for (let refinePass = 0; refinePass < 2; refinePass += 1) {
-                refinedWaypoints = resolveInterFlowCrossings(refinedWaypoints, normalizedFlows, stepsById);
-                refinedWaypoints = enforceOrthogonalWaypoints(refinedWaypoints, normalizedFlows, stepsById);
-                refinedWaypoints = resolveFlowOverShapeIntersections(
-                    refinedWaypoints,
-                    normalizedFlows,
-                    stepRects,
-                    laneBounds,
-                    stepsById
-                );
-            }
-            const withGatewayDiagonals = enforceGatewayExitDiagonals(refinedWaypoints, normalizedFlows, stepsById);
-            const finalWaypoints = enforceDominantForwardEdges(
-                withGatewayDiagonals,
-                normalizedFlows,
-                stepsById,
-                positions
-            );
-            const splitPatternWaypoints = enforceGatewaySplitPattern(
-                finalWaypoints,
-                normalizedFlows,
-                stepsById
-            );
-            const endpointSafeWaypoints = enforceFlowEndpoints(
-                splitPatternWaypoints,
-                normalizedFlows,
-                stepsById,
-                positions,
-                laneMeta,
-                outgoingIndexMeta
-            );
-            const postEndpointResolved = resolveInterFlowCrossings(endpointSafeWaypoints, normalizedFlows, stepsById);
-            const postEndpointOrthogonal = enforceOrthogonalWaypoints(postEndpointResolved, normalizedFlows, stepsById);
-            const postEndpointSeparated = separateParallelSegmentOverlaps(postEndpointOrthogonal, normalizedFlows, stepsById);
-            const postEndpointSeparatedOrthogonal = enforceOrthogonalWaypoints(postEndpointSeparated, normalizedFlows, stepsById);
-            const postEndpointCollisionReduced = resolveFlowOverShapeIntersections(
-                postEndpointSeparatedOrthogonal,
-                normalizedFlows,
-                stepRects,
-                laneBounds,
-                stepsById
-            );
-            const postEndpointCollisionOrthogonal = enforceOrthogonalWaypoints(
-                postEndpointCollisionReduced,
-                normalizedFlows,
-                stepsById
-            );
-            const withFlowBridges = applyFlowBridges(postEndpointCollisionOrthogonal, normalizedFlows, stepsById);
-            const finalEndpointWaypoints = enforceFlowEndpoints(
-                withFlowBridges,
-                normalizedFlows,
-                stepsById,
-                positions,
-                laneMeta,
-                outgoingIndexMeta
-            );
-            const postFinalEndpointCollisionReduced = resolveFlowOverShapeIntersections(
-                finalEndpointWaypoints,
-                normalizedFlows,
-                stepRects,
-                laneBounds,
-                stepsById
-            );
-            return enforceOrthogonalWaypoints(
-                postFinalEndpointCollisionReduced,
-                normalizedFlows,
-                stepsById
-            );
-        })();
+    let refinedWaypoints = flowWaypoints.map((points) => points.map((p) => ({ ...p })));
+    for (let refinePass = 0; refinePass < 2; refinePass += 1) {
+        refinedWaypoints = resolveInterFlowCrossings(refinedWaypoints, normalizedFlows, stepsById);
+        refinedWaypoints = enforceOrthogonalWaypoints(refinedWaypoints, normalizedFlows, stepsById);
+        refinedWaypoints = resolveFlowOverShapeIntersections(
+            refinedWaypoints,
+            normalizedFlows,
+            stepRects,
+            laneBounds,
+            stepsById
+        );
+    }
+    const withGatewayDiagonals = enforceGatewayExitDiagonals(refinedWaypoints, normalizedFlows, stepsById);
+    const finalWaypoints = enforceDominantForwardEdges(
+        withGatewayDiagonals,
+        normalizedFlows,
+        stepsById,
+        positions
+    );
+    const splitPatternWaypoints = enforceGatewaySplitPattern(
+        finalWaypoints,
+        normalizedFlows,
+        stepsById
+    );
+    const endpointSafeWaypoints = enforceFlowEndpoints(
+        splitPatternWaypoints,
+        normalizedFlows,
+        stepsById,
+        positions,
+        laneMeta,
+        outgoingIndexMeta
+    );
+    const postEndpointResolved = resolveInterFlowCrossings(endpointSafeWaypoints, normalizedFlows, stepsById);
+    const postEndpointOrthogonal = enforceOrthogonalWaypoints(postEndpointResolved, normalizedFlows, stepsById);
+    const postEndpointSeparated = separateParallelSegmentOverlaps(postEndpointOrthogonal, normalizedFlows, stepsById);
+    const postEndpointSeparatedOrthogonal = enforceOrthogonalWaypoints(postEndpointSeparated, normalizedFlows, stepsById);
+    const postEndpointCollisionReduced = resolveFlowOverShapeIntersections(
+        postEndpointSeparatedOrthogonal,
+        normalizedFlows,
+        stepRects,
+        laneBounds,
+        stepsById
+    );
+    const postEndpointCollisionOrthogonal = enforceOrthogonalWaypoints(
+        postEndpointCollisionReduced,
+        normalizedFlows,
+        stepsById
+    );
+    const withFlowBridges = applyFlowBridges(postEndpointCollisionOrthogonal, normalizedFlows, stepsById);
+    const finalEndpointWaypoints = enforceFlowEndpoints(
+        withFlowBridges,
+        normalizedFlows,
+        stepsById,
+        positions,
+        laneMeta,
+        outgoingIndexMeta
+    );
     normalizedFlows.forEach((flow, i) => {
-        const waypoints = compactOrthogonalWaypoints(finalRenderWaypoints[i] || []);
+        const waypoints = compactOrthogonalWaypoints(finalEndpointWaypoints[i] || []);
         if (!waypoints || waypoints.length === 0) return;
         const waypointXml = waypoints
             .map((point) => `<di:waypoint x="${snap(point.x)}" y="${snap(point.y)}" />`)
             .join("");
         const fromStep = stepsById.get(flow.from);
-        const isSequenceFlow = flowElementTypeByIndex.get(i) === "sequenceFlow";
-        const hasConditionLabel = isSequenceFlow && Boolean(flow.condition);
+        const hasConditionLabel = Boolean(flow.condition);
         const branchKind = classifyBranchLabel(flow.condition);
         const labelAnchor = fromStep?.type === "gateway"
             ? (

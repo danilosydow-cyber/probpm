@@ -11,7 +11,6 @@ import { analyzeTextToProcess } from "./services/analyzer.js";
 import { optimizeProcessText } from "./services/analyzer/index.js";
 import { getBpmnKnowledgeBase } from "./services/bpmnKnowledgeBase.js";
 import { generateBPMN } from "./services/bpmnGenerator.js";
-import { buildBpmnQualityScorecard } from "./services/bpmnQualityScorecard.js";
 import { AppError, toErrorResponse } from "./utils/apiErrors.js";
 
 const defaultPort = Number(process.env.PORT) || 5000;
@@ -20,8 +19,7 @@ export function createApp({
     analyzeText = analyzeTextToProcess,
     optimizeText = optimizeProcessText,
     getKnowledgeBase = getBpmnKnowledgeBase,
-    generateBpmn = generateBPMN,
-    buildScorecard = buildBpmnQualityScorecard
+    generateBpmn = generateBPMN
 } = {}) {
     const app = express();
 
@@ -29,7 +27,7 @@ export function createApp({
     app.use(express.json({ limit: "512kb" }));
 
     app.use("/api/analyze", createAnalyzeRouter({ analyzeText }));
-    app.use("/api/generate", createGenerateRouter({ analyzeText, generateBpmn, buildScorecard }));
+    app.use("/api/generate", createGenerateRouter({ analyzeText, generateBpmn }));
     app.use("/api/optimize", createOptimizeRouter({ optimizeText }));
     app.use("/api/bpmn-knowledge-base", createBpmnKnowledgeBaseRouter({ getKnowledgeBase }));
 

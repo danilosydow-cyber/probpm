@@ -3,61 +3,134 @@ import express from "express";
 import { analyzeTextToProcess } from "../services/analyzer.js";
 import { generateBPMN } from "../services/bpmnGenerator.js";
 import { buildRoutingDebug } from "../services/bpmnRoutingDebug.js";
-import { recordQualityScorecard } from "../services/bpmnQualityLearning.js";
-import { buildBpmnQualityScorecard } from "../services/bpmnQualityScorecard.js";
 import { validateTextInput } from "../middleware/validateTextInput.js";
+
+function buildIncrementalProcessModel(processJson, fraction = 1) {
+    const sourceSteps = Array.isArray(processJson?.steps) ? processJson.steps : [];
+    if (sourceSteps.length <= 1) return processJson;
+    const keepCount = Math.max(2, Math.min(sourceSteps.length, Math.floor(sourceSteps.length * fraction)));
+    const keepSteps = sourceSteps.slice(0, keepCount);
+    const keepIds = new Set(keepSteps.map((step) => step.id));
+
+    const filteredSteps = keepSteps.map((step) => {
+        const next = Array.isArray(step?.next) ? step.next.filter((id) => keepIds.has(id)) : [];
+        const conditions = Array.isArray(step?.conditions)
+            ? step.conditions
+                .filter((condition) => keepIds.has(condition?.target))
+                .map((condition) => ({ ...condition }))
+            : [];
+        return {
+            ...step,
+            next,
+            conditions
+        };
+    });
+
+    return {
+        ...processJson,
+        steps: filteredSteps
+    };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function createGenerateRouter({
     analyzeText = analyzeTextToProcess,
-    generateBpmn = generateBPMN,
-    buildScorecard = buildBpmnQualityScorecard,
-    recordScorecard = recordQualityScorecard
+    generateBpmn = generateBPMN
 } = {}) {
     const router = express.Router();
-    const needsRelayout = (scorecard = {}) => Boolean(scorecard?.gate?.needsRelayout);
-    const isBlockingGate = (scorecard = {}) => Boolean(scorecard?.gate?.blocking);
 
+    // Design-Regel 4: Echtzeit-Visualisierung während der Analyse
     router.post("/", validateTextInput, async (req, res, next) => {
         try {
-            const strictQualityGate = String(req.query?.strictQualityGate || "").toLowerCase() === "true";
-            const processJson = await analyzeText(req.validatedText);
-            let xml = generateBpmn(processJson);
-            let qualityScorecard = buildScorecard(processJson, { xml });
-            let qualityGateStatus = "passed_initial";
-            let qualityGateMessage = "";
-
-            if (needsRelayout(qualityScorecard)) {
-                const relayoutXml = generateBpmn(processJson, { strictQuality: true });
-                const relayoutScorecard = buildScorecard(processJson, { xml: relayoutXml });
-                if (!needsRelayout(relayoutScorecard)) {
-                    xml = relayoutXml;
-                    qualityScorecard = relayoutScorecard;
-                    qualityGateStatus = "passed_relayout";
-                } else {
+            const enableRealTime = String(req.query?.realTime || "").toLowerCase() === "true";
+            
+            // Echtzeit-Modus: Server-Sent Events
+            if (enableRealTime) {
+                res.writeHead(200, {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Access-Control-Allow-Origin': '*'
+                });
+                
+                const sendUpdate = (type, data) => {
+                    res.write(`event: ${type}\n`);
+                    res.write(`data: ${JSON.stringify(data)}\n\n`);
+                    if (typeof res.flush === "function") {
+                        res.flush();
+                    }
+                };
+                
+                try {
+                    sendUpdate('start', { message: 'Analyse gestartet...', timestamp: Date.now() });
+                    
+                    // Schritt 1: Textanalyse
+                    sendUpdate('progress', { step: 'analyze', message: 'Text wird analysiert...', progress: 10 });
+                    const processJson = await analyzeText(req.validatedText);
+                    sendUpdate('progress', { step: 'analyze_complete', message: 'Textanalyse abgeschlossen', progress: 30, data: { steps: processJson.steps?.length || 0 } });
+                    
+                    // Schritt 2: BPMN-Generierung
+                    sendUpdate('progress', { step: 'generate', message: 'BPMN-Modell wird generiert...', progress: 40 });
+                    const previewFractions = [0.35, 0.6, 0.85];
+                    for (let idx = 0; idx < previewFractions.length; idx += 1) {
+                        const fraction = previewFractions[idx];
+                        try {
+                            const previewModel = buildIncrementalProcessModel(processJson, fraction);
+                            const previewXml = generateBpmn(previewModel);
+                            sendUpdate('progress', {
+                                step: `generate_preview_${idx + 1}`,
+                                message: `Zwischenstand ${idx + 1}/${previewFractions.length} wird aufgebaut...`,
+                                progress: 46 + idx * 6,
+                                data: {
+                                    xml: previewXml,
+                                    previewStage: idx + 1
+                                }
+                            });
+                        } catch (_previewErr) {
+                            // Ignore preview issues; final generation remains authoritative.
+                        }
+                        // Let network/client breathe between previews.
+                        await sleep(160);
+                    }
+                    let xml = generateBpmn(processJson);
+                    sendUpdate('progress', {
+                        step: 'generate_complete',
+                        message: 'BPMN-Modell generiert',
+                        progress: 85,
+                        data: {
+                            xml,
+                            xmlPreview: xml.substring(0, 500) + '...'
+                        }
+                    });
+                    
+                    // Schritt 5: Finalisierung
+                    sendUpdate('progress', { step: 'finalizing', message: 'Finalisierung...', progress: 95 });
                     const debugRouting = String(req.query?.debugRouting || "").toLowerCase() === "true";
                     const routingDebug = debugRouting ? buildRoutingDebug(processJson) : null;
-                    qualityGateStatus = "failed_after_relayout";
-                    qualityGateMessage = isBlockingGate(relayoutScorecard)
-                        ? "Layout-Qualitaetsgrenzen verletzt (outOfWorkspace/avoidableCrossings/flowShapeOverlaps)."
-                        : "Best-effort Modell ausgegeben: nicht-blockierende Layoutwarnungen nach Relayout verbleiben.";
-                    xml = relayoutXml;
-                    qualityScorecard = relayoutScorecard;
-                    if (strictQualityGate && isBlockingGate(qualityScorecard)) {
-                        return res.status(422).json({
-                            success: false,
-                            code: "QUALITY_GATE_FAILED",
-                            error: qualityGateMessage,
-                            message: qualityGateMessage,
-                            json: processJson,
-                            xml,
-                            qualityScorecard,
-                            routingDebug,
-                            qualityGateStatus
-                        });
-                    }
+                    
+                    sendUpdate('complete', {
+                        success: true,
+                        json: processJson,
+                        xml,
+                        routingDebug
+                    });
+                    
+                } catch (error) {
+                    sendUpdate('error', { 
+                        code: "PROCESSING_ERROR", 
+                        error: error.message,
+                        message: 'Fehler bei der Verarbeitung' 
+                    });
                 }
+                
+                res.end();
+                return;
             }
-            const learningState = recordScorecard(qualityScorecard);
+            
+            // Standard-Modus (ohne Echtzeit)
+            const processJson = await analyzeText(req.validatedText);
+            const xml = generateBpmn(processJson);
             const debugRouting = String(req.query?.debugRouting || "").toLowerCase() === "true";
             const routingDebug = debugRouting ? buildRoutingDebug(processJson) : null;
 
@@ -65,14 +138,7 @@ export function createGenerateRouter({
                 success: true,
                 json: processJson,
                 xml,
-                qualityScorecard,
-                routingDebug,
-                qualityGateStatus,
-                qualityGateMessage: qualityGateMessage || undefined,
-                learning: {
-                    totalModelsEvaluated: learningState.totalModelsEvaluated,
-                    recentScores: Array.isArray(learningState.recentScores) ? learningState.recentScores.slice(0, 5) : []
-                }
+                routingDebug
             });
         } catch (err) {
             next(err);

@@ -63,21 +63,26 @@ const escapeHtml = (value) => String(value)
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const tokenizeWords = (input) => String(input || "").match(/[\p{L}][\p{L}\p{N}-]*/gu) || [];
 const normalizeWord = (word) => String(word || "").toLowerCase().trim();
-const QUALITY_GATE_REASON_LABELS = {
-    outOfWorkspaceFlows: "Flows außerhalb des Arbeitsbereichs",
-    flowCrossingsAvoidable: "Vermeidbare Kreuzungen",
-    flowShapeOverlaps: "Flow-über-Element Überlagerungen"
-};
-const QUALITY_GATE_REASON_ACTIONS = {
-    outOfWorkspaceFlows: "Betroffene Schritte dichter im Lane-Bereich platzieren oder Relayout ausführen.",
-    flowCrossingsAvoidable: "Verzweigungen horizontal entzerren und parallele Pfade vertikal staffeln.",
-    flowShapeOverlaps: "Zwischen betroffenen Elementen mehr Abstand schaffen und Kanten neu routen."
-};
-
-const QUALITY_GATE_STATUS_LABELS = {
-    passed_initial: "Bestanden (direkt)",
-    passed_relayout: "Bestanden (nach Relayout)",
-    failed_after_relayout: "Warnung nach Relayout"
+const parseSseEventChunk = (rawChunk = "") => {
+    const lines = String(rawChunk || "").split(/\r?\n/);
+    let event = "message";
+    const dataLines = [];
+    lines.forEach((line) => {
+        if (line.startsWith("event:")) {
+            event = line.slice(6).trim() || "message";
+            return;
+        }
+        if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trim());
+        }
+    });
+    if (dataLines.length === 0) return null;
+    const dataRaw = dataLines.join("\n");
+    try {
+        return { event, data: JSON.parse(dataRaw) };
+    } catch {
+        return { event, data: { message: dataRaw } };
+    }
 };
 
 const getStemFromVerbLikeTerm = (word) => normalizeWord(word)
@@ -155,14 +160,7 @@ function App() {
     const [isDragOverEditor, setIsDragOverEditor] = useState(false);
     const [useAiOptimization, setUseAiOptimization] = useState(true);
     const [optimizedInputPreview, setOptimizedInputPreview] = useState("");
-    const [qualityScorecard, setQualityScorecard] = useState(null);
-    const [qualityGateStatus, setQualityGateStatus] = useState("");
-    const [qualityGateMessage, setQualityGateMessage] = useState("");
-    const [modelsEvaluated, setModelsEvaluated] = useState(0);
-    const [recentQualityScores, setRecentQualityScores] = useState([]);
     const [showRoutingDebug, setShowRoutingDebug] = useState(false);
-    const [routingDebug, setRoutingDebug] = useState(null);
-    const [showLoopsOnly, setShowLoopsOnly] = useState(false);
     const [allocationSearch, setAllocationSearch] = useState("");
     const [allocationElementFilter, setAllocationElementFilter] = useState("all");
     const [allocationSortBy, setAllocationSortBy] = useState("source");
@@ -449,8 +447,6 @@ function App() {
 
         setError("");
         setWarning("");
-        setQualityGateStatus("");
-        setQualityGateMessage("");
         setShowDownloadOptions(true);
         setStatus(useAiOptimization ? "Optimiere Text fuer KI-Analyse..." : "Analysiere Prozess...");
         setIsLoading(true);
@@ -482,71 +478,86 @@ function App() {
                 setOptimizedInputPreview("");
             }
 
-            const debugQuery = showRoutingDebug ? "?debugRouting=true" : "";
-            const res = await fetch(`${API_BASE_URL}/api/generate${debugQuery}`, {
+            const params = new URLSearchParams({
+                realTime: "true"
+            });
+            if (showRoutingDebug) {
+                params.set("debugRouting", "true");
+            }
+            const res = await fetch(`${API_BASE_URL}/api/generate?${params.toString()}`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
                 },
                 body: JSON.stringify({ text: analysisText })
             });
+            if (!res.ok) {
+                const fallback = await res.json().catch(() => ({}));
+                throw new Error(String(fallback?.error || fallback?.message || "Unbekannter Fehler bei der Analyse."));
+            }
+            if (!res.body) {
+                throw new Error("Streaming-Antwort konnte nicht gelesen werden.");
+            }
 
-            const data = await res.json();
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let completed = false;
 
-            if (res.ok && data.success) {
-                setJson(data.json);
-                setXml(data.xml);
-                setQualityScorecard(data.qualityScorecard || null);
-                setQualityGateStatus(String(data?.qualityGateStatus || ""));
-                setQualityGateMessage(String(data?.qualityGateMessage || ""));
-                setModelsEvaluated(Number(data?.learning?.totalModelsEvaluated || 0));
-                setRecentQualityScores(Array.isArray(data?.learning?.recentScores) ? data.learning.recentScores : []);
-                setRoutingDebug(data?.routingDebug || null);
-                if (data?.qualityGateStatus === "failed_after_relayout") {
-                    const gateMsg = String(data?.qualityGateMessage || "").trim()
-                        || "Qualitaetsgrenzen weiterhin verletzt; Best-Effort-Modell angezeigt.";
-                    setWarning(gateMsg);
-                    setStatus("Analyse erfolgreich (mit Quality-Warnung).");
-                } else {
-                    setWarning("");
-                    setStatus("Analyse erfolgreich.");
+            while (!completed) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const chunks = buffer.split("\n\n");
+                buffer = chunks.pop() || "";
+
+                for (const chunk of chunks) {
+                    const parsed = parseSseEventChunk(chunk);
+                    if (!parsed) continue;
+                    const { event, data } = parsed;
+
+                    if (event === "start") {
+                        setStatus(String(data?.message || "Analyse gestartet..."));
+                        continue;
+                    }
+                    if (event === "progress") {
+                        const msg = String(data?.message || "Berechne...");
+                        setStatus(msg);
+                        if (typeof data?.data?.xml === "string" && data.data.xml.trim()) {
+                            setXml(String(data.data.xml));
+                            // Ensure progressive imports are visually noticeable.
+                            // This prevents React from collapsing multiple XML updates into one frame.
+                            await new Promise((resolve) => window.setTimeout(resolve, 120));
+                        }
+                        continue;
+                    }
+                    if (event === "complete") {
+                        completed = true;
+                        if (data?.success) {
+                            setJson(data.json);
+                            setXml(data.xml);
+                            setWarning("");
+                            setStatus("Analyse erfolgreich.");
+                        }
+                        continue;
+                    }
+                    if (event === "error") {
+                        completed = true;
+                        const backendMessage = data?.error || data?.message || "Unbekannter Fehler bei der Analyse.";
+                        const backendCode = String(data?.code || "").trim();
+                        setWarning("");
+                        setError(backendCode ? `${backendCode}: ${backendMessage}` : backendMessage);
+                        setStatus("Analyse fehlgeschlagen.");
+                    }
                 }
-            } else {
-                const backendMessage = data?.error || data?.message || "Unbekannter Fehler bei der Analyse.";
-                const backendCode = String(data?.code || "").trim();
-                const details = data?.qualityScorecard?.metrics;
-                if (backendCode === "QUALITY_GATE_FAILED") {
-                    setJson(data.json || null);
-                    setXml(data.xml || "");
-                    setQualityScorecard(data.qualityScorecard || null);
-                    setQualityGateStatus(String(data?.qualityGateStatus || "failed_after_relayout"));
-                    setQualityGateMessage(String(data?.error || data?.message || ""));
-                    setRoutingDebug(data?.routingDebug || null);
-                    const metricHint = details
-                        ? ` outOfWorkspace=${details.outOfWorkspaceFlows}, avoidableCrossings=${details.flowCrossingsAvoidable}, flowShapeOverlaps=${details.flowShapeOverlaps}`
-                        : "";
-                    setWarning(`Quality Gate blockiert die Ausgabe im Strict-Modus: ${backendMessage}.${metricHint}`);
-                    setError("");
-                    setStatus("Analyse abgelehnt: Quality-Gate verletzt.");
-                } else {
-                    setQualityScorecard(null);
-                    setQualityGateStatus("");
-                    setQualityGateMessage("");
-                    setRecentQualityScores([]);
-                    setRoutingDebug(null);
-                    setWarning("");
-                    setError(backendCode ? `${backendCode}: ${backendMessage}` : backendMessage);
-                    setStatus("Analyse fehlgeschlagen.");
-                }
+            }
+
+            if (!completed) {
+                throw new Error("Streaming wurde unerwartet beendet.");
             }
 
         } catch (err) {
             console.error(err);
-            setQualityScorecard(null);
-            setQualityGateStatus("");
-            setQualityGateMessage("");
-            setRecentQualityScores([]);
-            setRoutingDebug(null);
             setWarning("");
             setError(`Backend nicht erreichbar unter ${API_BASE_URL}.`);
             setStatus("Backend nicht erreichbar.");
@@ -1349,85 +1360,7 @@ function App() {
                     <div>Anzahl identifizierter Aktivitäten: <strong>{activitiesCount}</strong></div>
                     <div>Anzahl identifizierter Gateways: <strong>{gatewaysCount}</strong></div>
                 </div>
-                {qualityScorecard ? (
-                    <div className="quality-scorecard">
-                        <h3>Qualität & Lerntrend</h3>
-                        <div>Qualitätsscore: <strong>{qualityScorecard.score}/{qualityScorecard.maxScore}</strong> ({qualityScorecard.percent}%)</div>
-                        <div>Qualitätsnote: <strong>{qualityScorecard.grade}</strong></div>
-                        <div>Modelle bewertet: <strong>{modelsEvaluated}</strong></div>
-                        <div className="quality-gate-summary">
-                            <span className={`quality-gate-badge quality-gate-severity-${qualityScorecard?.gate?.severity || "info"}`}>
-                                {QUALITY_GATE_STATUS_LABELS[qualityGateStatus] || "Keine Gate-Information"}
-                            </span>
-                            <span>
-                                Gate-Severity: <strong>{String(qualityScorecard?.gate?.severity || "info").toUpperCase()}</strong>
-                            </span>
-                        </div>
-                        {qualityGateMessage ? (
-                            <div className="quality-gate-message">{qualityGateMessage}</div>
-                        ) : null}
-                        {Array.isArray(qualityScorecard?.gate?.reasons) && qualityScorecard.gate.reasons.length > 0 ? (
-                            <div className="quality-gate-reasons">
-                                {qualityScorecard.gate.reasons.map((reason) => (
-                                    <div key={reason} className="quality-gate-reason-item">
-                                        <strong>{QUALITY_GATE_REASON_LABELS[reason] || reason}:</strong>{" "}
-                                        {reason === "outOfWorkspaceFlows" ? qualityScorecard?.metrics?.outOfWorkspaceFlows : null}
-                                        {reason === "flowCrossingsAvoidable" ? qualityScorecard?.metrics?.flowCrossingsAvoidable : null}
-                                        {reason === "flowShapeOverlaps" ? qualityScorecard?.metrics?.flowShapeOverlaps : null}
-                                        <div className="quality-gate-reason-action">
-                                            Empfehlung: {QUALITY_GATE_REASON_ACTIONS[reason] || "Layout erneut berechnen und kritische Kanten prüfen."}
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        ) : (
-                            <div className="quality-ok">Quality Gate ohne aktive Layout-Warnursachen.</div>
-                        )}
-                        {recentQualityScores.length > 0 ? (
-                            <div className="quality-trend">
-                                <strong>Trend letzte 5:</strong>
-                                {recentQualityScores.map((entry, idx) => (
-                                    <span key={`${entry.at}-${idx}`} className="quality-trend-chip">
-                                        {entry.percent}% ({entry.grade})
-                                    </span>
-                                ))}
-                            </div>
-                        ) : null}
-                        {Array.isArray(qualityScorecard.violations) && qualityScorecard.violations.length > 0 ? (
-                            <div className="quality-violations">
-                                {qualityScorecard.violations.slice(0, 3).map((violation) => (
-                                    <div key={`${violation.code}-${violation.title}`} className="quality-violation-item">
-                                        <strong>{violation.code}:</strong> {violation.suggestion}
-                                    </div>
-                                ))}
-                            </div>
-                        ) : (
-                            <div className="quality-ok">Keine kritischen Regelverstöße erkannt.</div>
-                        )}
-                        {showRoutingDebug && routingDebug?.flows?.length > 0 ? (
-                            <div className="quality-trend">
-                                <strong>Routing-Typen:</strong>
-                                <label className="ai-toggle quality-inline-toggle">
-                                    <input
-                                        type="checkbox"
-                                        checked={showLoopsOnly}
-                                        onChange={(e) => setShowLoopsOnly(e.target.checked)}
-                                        disabled={isLoading}
-                                    />
-                                    nur loops
-                                </label>
-                                {(showLoopsOnly
-                                    ? routingDebug.flows.filter((flow) => flow.type === "loop")
-                                    : routingDebug.flows
-                                ).slice(0, 10).map((flow) => (
-                                    <span key={flow.id} className={`quality-trend-chip flow-chip-${flow.type}`}>
-                                        {flow.id}:{flow.type}
-                                    </span>
-                                ))}
-                            </div>
-                        ) : null}
-                    </div>
-                ) : null}
+                
             </div>
 
             <div className="allocation-list">
