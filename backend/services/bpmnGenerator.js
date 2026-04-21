@@ -2305,10 +2305,14 @@ export function generateBPMN(process, options = {}) {
             if (s?.type !== "gateway") return max;
             return Math.max(max, (outgoingBySourceList.get(stepId) || []).length);
         }, 1);
-        const branchBuffer = Math.max(0, maxFanIn - 1) * 20 + Math.max(0, maxFanOut - 1) * 16;
-        const gatewayBranchBuffer = Math.max(0, maxGatewayFanOut - 1) * 30;
+        const branchComplexity = Math.max(0, Math.max(maxFanIn, maxFanOut) - 1);
+        const branchBuffer = Math.min(
+            96,
+            branchComplexity * 18 + Math.max(0, (maxFanIn + maxFanOut - 2)) * 6
+        );
+        const gatewayBranchBuffer = Math.min(108, Math.max(0, maxGatewayFanOut - 1) * 18);
         const maxStack = Math.max(1, ...groupSizes);
-        const stackHeight = (maxStack - 1) * STEP_SLOT + 60;
+        const stackHeight = (maxStack - 1) * STEP_SLOT + 48;
         const hasGateway = role.steps.some((stepId) => stepByIdWithStart.get(stepId)?.type === "gateway");
         const gatewayBuffer = hasGateway ? 12 : 0;
         const externalHeight = 72;
@@ -2499,35 +2503,40 @@ export function generateBPMN(process, options = {}) {
         }
     }
 
-    const nonEndRight = Math.max(
-        ...steps
-            .filter((step) => step.type !== "endEvent")
-            .map((step) => {
-                const pos = positions[step.id];
-                const size = getNodeSize(step);
-                return (pos?.x || 0) + size.width;
-            })
-    );
-    const endByRole = new Map();
-    steps.filter((step) => step.type === "endEvent").forEach((step) => {
-        const key = step._roleId || "_default";
-        const list = endByRole.get(key) || [];
-        list.push(step);
-        endByRole.set(key, list);
-    });
-    endByRole.forEach((endSteps, roleId) => {
-        const lane = laneMeta[roleId];
+    const placeEndEventsAtModelEnd = () => {
+        const endSteps = steps
+            .filter((step) => step.type === "endEvent" && positions[step.id])
+            .sort((a, b) => {
+                const rankA = Number(rank[a.id] ?? Number.MAX_SAFE_INTEGER);
+                const rankB = Number(rank[b.id] ?? Number.MAX_SAFE_INTEGER);
+                if (rankA !== rankB) return rankA - rankB;
+                return (positions[a.id]?.y || 0) - (positions[b.id]?.y || 0);
+            });
+        if (endSteps.length === 0) return;
+        const nonEndRight = Math.max(
+            ...steps
+                .filter((step) => step.type !== "endEvent")
+                .map((step) => {
+                    const pos = positions[step.id];
+                    const size = getNodeSize(step);
+                    return (pos?.x || 0) + size.width;
+                })
+        );
+        const allLaneMinY = Math.min(...Object.values(laneMeta).map((lane) => lane.y + LANE_PADDING));
+        const allLaneMaxY = Math.max(...Object.values(laneMeta).map((lane) => lane.y + lane.height - LANE_PADDING));
+        const endColumnX = snap(nonEndRight + 156);
+        const endSpacing = 72;
         endSteps.forEach((step, idx) => {
             const pos = positions[step.id];
             if (!pos) return;
             const size = getNodeSize(step);
-            const preferredCenterY = lane ? lane.y + lane.height / 2 : pos.y + size.height / 2;
-            const minY = lane ? lane.y + LANE_PADDING : pos.y;
-            const maxY = lane ? lane.y + lane.height - LANE_PADDING - size.height : pos.y;
-            pos.x = snap(nonEndRight + 144 + idx * 60);
-            pos.y = snap(Math.max(minY, Math.min(maxY, preferredCenterY - size.height / 2)));
+            const rawY = snap(allLaneMinY + idx * endSpacing);
+            const clampedY = snap(Math.max(allLaneMinY, Math.min(allLaneMaxY - size.height, rawY)));
+            pos.x = endColumnX;
+            pos.y = clampedY;
         });
-    });
+    };
+    placeEndEventsAtModelEnd();
 
     // Adaptive compaction: tighten horizontal whitespace inside lanes,
     // but only for simple nodes to avoid creating crossing clusters.
@@ -2637,7 +2646,8 @@ export function generateBPMN(process, options = {}) {
     // Gateway -> activity placement:
     // place successor right / above / below depending on branch start direction.
     const GATEWAY_TO_ACTIVITY_GAP_X = 48;
-    const GATEWAY_TO_ACTIVITY_GAP_Y = 24;
+    const GATEWAY_TO_ACTIVITY_GAP_Y = 200;
+    const gatewayTopBottomTargetIds = new Set();
     const gatewayToActivities = new Map();
     normalizedFlows.forEach((flow) => {
         const fromStep = stepById.get(flow.from);
@@ -2668,7 +2678,7 @@ export function generateBPMN(process, options = {}) {
                 return;
             }
             const targetLane = toLaneId ? laneMeta[toLaneId] : null;
-            const targetCenterY = targetLane ? (targetLane.y + targetLane.height / 2) : gatewayCenterY;
+            const targetCenterY = targetLane ? (targetLane.y + targetLane.height / 2) : (positions[entry.flow.to]?.y || gatewayCenterY);
             if (targetCenterY < gatewayCenterY) aboveTargets.push(entry);
             else belowTargets.push(entry);
         });
@@ -2698,6 +2708,7 @@ export function generateBPMN(process, options = {}) {
                 toPos.y = snap(Math.max(minY, Math.min(maxY, gatewayCenterY - toSize.height / 2 + yOffset)));
                 return;
             }
+            gatewayTopBottomTargetIds.add(entry.flow.to);
             // For top/bottom branches, place activity exactly above/below gateway center.
             toPos.x = centeredX;
             const preferredY = slot === "top"
@@ -2713,6 +2724,7 @@ export function generateBPMN(process, options = {}) {
         steps.forEach((step) => {
             if (!step || step._isExternalActorStep || step._roleId !== roleId) return;
             if (step.type === "boundaryTimer") return;
+            if (gatewayTopBottomTargetIds.has(step.id)) return;
             const pos = positions[step.id];
             if (!pos) return;
             const size = getNodeSize(step);
@@ -2746,6 +2758,41 @@ export function generateBPMN(process, options = {}) {
             startPosFinal.y = desiredY;
         }
     }
+
+    // Hard sequence ordering inside each lane:
+    // place steps left-to-right according to process rank with a fixed gap.
+    const LANE_SEQUENCE_GAP = 42;
+    Object.entries(laneMeta).forEach(([roleId]) => {
+        const laneSteps = steps
+            .filter((step) => (
+                step
+                && !step._isExternalActorStep
+                && step._roleId === roleId
+                && step.type !== "boundaryTimer"
+                && !gatewayTopBottomTargetIds.has(step.id)
+                && positions[step.id]
+            ))
+            .sort((a, b) => {
+                const rankA = Number(rank[a.id] ?? Number.MAX_SAFE_INTEGER);
+                const rankB = Number(rank[b.id] ?? Number.MAX_SAFE_INTEGER);
+                if (rankA !== rankB) return rankA - rankB;
+                return (positions[a.id].x || 0) - (positions[b.id].x || 0);
+            });
+        for (let i = 1; i < laneSteps.length; i += 1) {
+            const prev = laneSteps[i - 1];
+            const current = laneSteps[i];
+            const prevPos = positions[prev.id];
+            const currentPos = positions[current.id];
+            if (!prevPos || !currentPos) continue;
+            const prevSize = getNodeSize(prev);
+            const minCurrentX = snap(prevPos.x + prevSize.width + LANE_SEQUENCE_GAP);
+            if (currentPos.x < minCurrentX) {
+                currentPos.x = minCurrentX;
+            }
+        }
+    });
+    // Re-apply end-event column after sequence compaction so they stay grouped.
+    placeEndEventsAtModelEnd();
 
     normalizedFlows.forEach((flow) => {
         const fromStep = stepById.get(flow.from);
@@ -2986,6 +3033,7 @@ id="Defs_1">
         steps.forEach((step) => {
             if (!step || step._isExternalActorStep || step._roleId !== roleId) return;
             if (step.type === "boundaryTimer") return;
+            if (gatewayTopBottomTargetIds.has(step.id)) return;
             const pos = positions[step.id];
             if (!pos) return;
             const size = getNodeSize(step);
@@ -3372,6 +3420,10 @@ id="Defs_1">
         const fromIsExternal = Boolean(fromStep?._isExternalActorStep && fromExternalLane);
         const toIsExternal = Boolean(toStep?._isExternalActorStep && toExternalLane);
         const sameLane = Boolean(fromStep?._roleId && toStep?._roleId && fromStep._roleId === toStep._roleId);
+        const gatewayToTopBottom = Boolean(
+            fromStep?.type === "gateway"
+            && gatewayTopBottomTargetIds.has(toStep?.id)
+        );
         if (fromIsExternal && !toIsExternal) {
             const x = snap(toPos.x + toSize.width / 2);
             start = { x, y: snap(fromExternalLane.y + fromExternalLane.height) };
@@ -3381,6 +3433,24 @@ id="Defs_1">
             const x = snap(fromPos.x + fromSize.width / 2);
             start = { x, y: snap(fromPos.y) };
             end = { x, y: snap(toExternalLane.y + toExternalLane.height) };
+            return [start, end];
+        }
+
+        if (gatewayToTopBottom) {
+            const gatewayCenterX = snap(fromPos.x + fromSize.width / 2);
+            const targetCenterX = snap(toPos.x + toSize.width / 2);
+            const verticalX = snap((gatewayCenterX + targetCenterX) / 2);
+            const targetCenterY = snap(toPos.y + toSize.height / 2);
+            const gatewayCenterY = snap(fromPos.y + fromSize.height / 2);
+            const targetAbove = targetCenterY < gatewayCenterY;
+            start = {
+                x: verticalX,
+                y: targetAbove ? snap(fromPos.y) : snap(fromPos.y + fromSize.height)
+            };
+            end = {
+                x: verticalX,
+                y: targetAbove ? snap(toPos.y + toSize.height) : snap(toPos.y)
+            };
             return [start, end];
         }
 

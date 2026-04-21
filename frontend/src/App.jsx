@@ -797,7 +797,28 @@ function App() {
     };
 
     const extractTextFromPlainFile = async (file) => {
-        return (await file.text()).replace(/\r/g, "").trim();
+        const normalize = (value) => String(value || "").replace(/\r/g, "").trim();
+        // Try the browser default first (usually UTF-8).
+        try {
+            const text = normalize(await file.text());
+            if (text) return text;
+        } catch (_err) {
+            // Fall through to manual decoder attempts.
+        }
+
+        // Some Windows .txt files are ANSI/Windows-1252 encoded.
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const decoders = ["utf-8", "windows-1252", "iso-8859-1"];
+        for (const encoding of decoders) {
+            try {
+                const decoder = new TextDecoder(encoding, { fatal: false });
+                const text = normalize(decoder.decode(bytes));
+                if (text) return text;
+            } catch (_err) {
+                // Try next encoding.
+            }
+        }
+        return "";
     };
 
     const processUploadedFile = async (file) => {
@@ -809,9 +830,8 @@ function App() {
         setIsExtractingDocument(true);
         setStatus(`Extrahiere Text aus ${fileName}...`);
 
+        let extractedText = "";
         try {
-            let extractedText = "";
-
             if (lowerName.endsWith(".pdf")) {
                 extractedText = await extractTextFromPdf(file);
             } else if (lowerName.endsWith(".docx")) {
@@ -826,21 +846,26 @@ function App() {
             } else {
                 throw new Error("Nicht unterstütztes Dateiformat. Bitte PDF, DOCX, TXT, MD, CSV oder JSON verwenden.");
             }
-
-            if (!extractedText || extractedText.trim().length === 0) {
-                throw new Error("Es konnte kein Text aus dem Dokument extrahiert werden.");
-            }
-
-            setText(extractedText);
-            setStatus(`Text aus ${fileName} erfolgreich geladen.`);
-            await runAnalysis(extractedText);
         } catch (err) {
             setError(err?.message || "Dokument konnte nicht verarbeitet werden.");
             setWarning("");
             setStatus("Dokument-Extraktion fehlgeschlagen.");
-        } finally {
             setIsExtractingDocument(false);
+            return;
         }
+
+        if (!extractedText || extractedText.trim().length === 0) {
+            setError("Es konnte kein Text aus dem Dokument extrahiert werden.");
+            setWarning("");
+            setStatus("Dokument-Extraktion fehlgeschlagen.");
+            setIsExtractingDocument(false);
+            return;
+        }
+
+        setText(extractedText);
+        setStatus(`Text aus ${fileName} erfolgreich geladen.`);
+        setIsExtractingDocument(false);
+        await runAnalysis(extractedText);
     };
 
     const handleUploadDocument = async (event) => {
