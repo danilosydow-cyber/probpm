@@ -40,6 +40,14 @@ function normalizeBranchLabel(label, fallback = "Bedingung") {
     return compactLabel(raw || fallback, 2);
 }
 
+function normalizeGatewayOutgoingLabel(label, fallback = "Bedingung") {
+    const raw = String(label || "").trim();
+    const kind = classifyBranchLabel(raw);
+    if (kind === "yes") return "JA";
+    if (kind === "no") return "NEIN";
+    return compactLabel(raw || fallback, 2);
+}
+
 function normalizeGatewayDisplayName(label) {
     const compact = compactLabel(label || "Entscheidung", 4) || "Entscheidung";
     if (compact.endsWith("?")) return compact;
@@ -2034,22 +2042,40 @@ export function generateBPMN(process, options = {}) {
         || step?.type === "subProcess"
         || step?.type === "callActivity"
     );
-    const firstActivityStep = steps.find((step) => isActivityLikeForStart(step));
-    if (firstActivityStep?.id) {
-        // Hard rule: start event always connects to the first activity.
-        normalizedFlows = normalizedFlows.filter((flow) => flow.from !== startId);
-        normalizedFlows.unshift({ from: startId, to: firstActivityStep.id });
-    }
-
     const roleMap = {};
+    const isExternalRoleName = (name) => {
+        const value = String(name || "").toLowerCase();
+        return /\b(kunde|bürger|buerger|extern|dienstleister|lieferant|partner|auftraggeber)\b/.test(value);
+    };
     roles.forEach((role, i) => {
         const id = typeof role === "string" ? `role_${i}` : role.id || `role_${i}`;
         const rawName = typeof role === "string" ? role : role.name || `Role ${i + 1}`;
         const name = compactLabel(rawName, 3) || `Role ${i + 1}`;
-        roleMap[id] = { id, name, steps: [] };
+        roleMap[id] = { id, name, steps: [], isExternal: isExternalRoleName(name) };
     });
+    let allRoleIds = Object.keys(roleMap);
+    let externalRoleIds = allRoleIds.filter((roleId) => roleMap[roleId]?.isExternal);
+    let internalRoleIds = allRoleIds.filter((roleId) => !roleMap[roleId]?.isExternal);
+    const refreshRoleBuckets = () => {
+        allRoleIds = Object.keys(roleMap);
+        externalRoleIds = allRoleIds.filter((roleId) => roleMap[roleId]?.isExternal);
+        internalRoleIds = allRoleIds.filter((roleId) => !roleMap[roleId]?.isExternal);
+    };
+    const ensureRoleForName = (rawRoleName) => {
+        const roleName = compactLabel(rawRoleName || "", 3);
+        if (!roleName) return "";
+        const existing = Object.values(roleMap).find((role) => role.name === roleName)?.id;
+        if (existing) return existing;
+        const safe = roleName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || `role_${Object.keys(roleMap).length + 1}`;
+        const id = `role_dynamic_${safe}`;
+        if (!roleMap[id]) {
+            roleMap[id] = { id, name: roleName, steps: [], isExternal: isExternalRoleName(roleName) };
+            refreshRoleBuckets();
+        }
+        return id;
+    };
 
-    const defaultRoleId = Object.keys(roleMap)[0];
+    let defaultRoleId = internalRoleIds[0] || allRoleIds[0];
 
     steps.forEach((step) => {
         let roleId;
@@ -2059,12 +2085,66 @@ export function generateBPMN(process, options = {}) {
             roleId = Object.values(roleMap).find((role) => role.name === targetStep?.role)?.id;
         } else {
             roleId = Object.values(roleMap).find((role) => role.name === step.role)?.id;
+            if (!roleId) roleId = ensureRoleForName(step.role);
         }
 
+        if (!defaultRoleId) defaultRoleId = ensureRoleForName(step.role) || defaultRoleId;
         if (!roleId) roleId = defaultRoleId;
-        roleMap[roleId].steps.push(step.id);
-        step._roleId = roleId;
+        step._originalRoleId = roleId;
+        step._isExternalActorStep = Boolean(roleMap[roleId]?.isExternal);
+        const effectiveRoleId = roleMap[roleId]?.isExternal && internalRoleIds.length > 0
+            ? internalRoleIds[0]
+            : roleId;
+        roleMap[effectiveRoleId].steps.push(step.id);
+        step._roleId = effectiveRoleId;
     });
+
+    // Start rule: if external actor provides input to start the process,
+    // route from external lane bottom to a message start event in internal lane.
+    const incomingTo = new Map();
+    normalizedFlows.forEach((flow) => {
+        incomingTo.set(flow.to, (incomingTo.get(flow.to) || 0) + 1);
+    });
+    const externalToInternalStartFlow = normalizedFlows.find((flow) => {
+        const fromStep = steps.find((s) => s.id === flow.from);
+        const toStep = steps.find((s) => s.id === flow.to);
+        if (!fromStep || !toStep) return false;
+        const fromExternal = Boolean(roleMap[fromStep._originalRoleId || ""]?.isExternal);
+        const toInternal = !Boolean(roleMap[toStep._originalRoleId || ""]?.isExternal);
+        const startsAtSource = (incomingTo.get(fromStep.id) || 0) <= 1;
+        return fromExternal && toInternal && startsAtSource;
+    });
+    const firstInternalActivityStep = steps.find((step) => {
+        const role = roleMap[step._originalRoleId || ""];
+        return !role?.isExternal && isActivityLikeForStart(step);
+    });
+    const startTargetId = externalToInternalStartFlow?.to || firstInternalActivityStep?.id;
+    if (startTargetId) {
+        normalizedFlows = normalizedFlows.filter((flow) => flow.from !== startId);
+        normalizedFlows.unshift({ from: startId, to: startTargetId });
+        const startStepRef = steps.find((s) => s.id === startId);
+        const startTargetStep = steps.find((s) => s.id === startTargetId);
+        if (startStepRef) {
+            startStepRef._messageStart = Boolean(externalToInternalStartFlow);
+            startStepRef._messageSourceRoleId = externalToInternalStartFlow
+                ? (steps.find((s) => s.id === externalToInternalStartFlow.from)?._originalRoleId || "")
+                : "";
+            // Keep the start event inside the responsible internal lane.
+            if (startTargetStep?._roleId) {
+                startStepRef._roleId = startTargetStep._roleId;
+                startStepRef._originalRoleId = startTargetStep._originalRoleId || startTargetStep._roleId;
+                // Ensure message start is rendered as internal flow node.
+                startStepRef._isExternalActorStep = Boolean(
+                    roleMap[startStepRef._originalRoleId]?.isExternal
+                );
+            }
+        }
+    }
+    // External input that initializes the process is represented by the
+    // dedicated association to the message start event, not by an extra flow.
+    if (externalToInternalStartFlow) {
+        normalizedFlows = normalizedFlows.filter((flow) => flow !== externalToInternalStartFlow);
+    }
 
     const liveById = new Map(steps.map((step) => [step.id, step]));
     steps.forEach((step) => {
@@ -2180,7 +2260,34 @@ export function generateBPMN(process, options = {}) {
         });
     });
 
-    Object.values(roleMap).forEach((role) => {
+    const internalRoles = internalRoleIds.map((roleId) => roleMap[roleId]).filter(Boolean);
+    const rolesSendingToExternal = new Set();
+    normalizedFlows.forEach((flow) => {
+        const fromStep = stepById.get(flow.from);
+        const toStep = stepById.get(flow.to);
+        if (!fromStep || !toStep) return;
+        if (externalRoleIds.includes(toStep._originalRoleId || "")) {
+            rolesSendingToExternal.add(fromStep._roleId);
+        }
+    });
+    const orderedInternalRoles = [...internalRoles].sort((a, b) => {
+        const aFlag = rolesSendingToExternal.has(a.id) ? 1 : 0;
+        const bFlag = rolesSendingToExternal.has(b.id) ? 1 : 0;
+        if (aFlag !== bFlag) return bFlag - aFlag;
+        return String(a.name || a.id).localeCompare(String(b.name || b.id));
+    });
+    const orderedRoles = [
+        ...externalRoleIds.map((roleId) => roleMap[roleId]).filter(Boolean),
+        ...orderedInternalRoles
+    ];
+
+    Object.values(roleMap).forEach((role) => { role.steps = []; });
+    steps.forEach((step) => {
+        if (!step?._roleId || !roleMap[step._roleId]) return;
+        roleMap[step._roleId].steps.push(step.id);
+    });
+
+    orderedRoles.forEach((role, idx) => {
         const groupSizes = [];
         roleRankGroups.forEach((group, key) => {
             if (key.startsWith(`${role.id}:`)) groupSizes.push(group.length);
@@ -2204,14 +2311,19 @@ export function generateBPMN(process, options = {}) {
         const stackHeight = (maxStack - 1) * STEP_SLOT + 60;
         const hasGateway = role.steps.some((stepId) => stepByIdWithStart.get(stepId)?.type === "gateway");
         const gatewayBuffer = hasGateway ? 12 : 0;
-        const height = snap(
-            Math.max(
-                LANE_BASE_HEIGHT,
-                stackHeight + LANE_PADDING * 2 + branchBuffer + gatewayBuffer + gatewayBranchBuffer
-            )
-        );
+        const externalHeight = 72;
+        const height = role.isExternal
+            ? externalHeight
+            : snap(
+                Math.max(
+                    LANE_BASE_HEIGHT,
+                    stackHeight + LANE_PADDING * 2 + branchBuffer + gatewayBuffer + gatewayBranchBuffer
+                )
+            );
         laneMeta[role.id] = { y: currentY, height };
-        currentY += height + LANE_GAP;
+        const nextRole = orderedRoles[idx + 1];
+        const gapAfter = role.isExternal || nextRole?.isExternal ? LANE_GAP : 0;
+        currentY += height + gapAfter;
     });
 
 
@@ -2545,18 +2657,27 @@ export function generateBPMN(process, options = {}) {
         if (!gatewayPos || !gatewayStep || targets.length === 0) return;
         const gatewaySize = getNodeSize(gatewayStep);
         const gatewayCenterY = gatewayPos.y + gatewaySize.height / 2;
-
-        // For 2+ successors enforce distinct placement around gateway:
-        // one right, one top, one bottom (then alternate top/bottom).
-        const sorted = [...targets].sort((a, b) => {
-            const posA = positions[a.flow.to];
-            const posB = positions[b.flow.to];
-            const yA = posA ? posA.y : 0;
-            const yB = posB ? posB.y : 0;
-            return yA - yB;
+        const sameLaneTargets = [];
+        const aboveTargets = [];
+        const belowTargets = [];
+        targets.forEach((entry) => {
+            const toLaneId = entry.toStep?._roleId;
+            const gatewayLaneId = gatewayStep?._roleId;
+            if (toLaneId && gatewayLaneId && toLaneId === gatewayLaneId) {
+                sameLaneTargets.push(entry);
+                return;
+            }
+            const targetLane = toLaneId ? laneMeta[toLaneId] : null;
+            const targetCenterY = targetLane ? (targetLane.y + targetLane.height / 2) : gatewayCenterY;
+            if (targetCenterY < gatewayCenterY) aboveTargets.push(entry);
+            else belowTargets.push(entry);
         });
-        const slotOrder = ["right", "top", "bottom"];
-        sorted.forEach((entry, idx) => {
+        const ordered = [
+            ...sameLaneTargets,
+            ...aboveTargets,
+            ...belowTargets
+        ];
+        ordered.forEach((entry, idx) => {
             const toPos = positions[entry.flow.to];
             if (!toPos) return;
             const toSize = getNodeSize(entry.toStep);
@@ -2565,13 +2686,16 @@ export function generateBPMN(process, options = {}) {
             const maxY = lane ? lane.y + lane.height - LANE_PADDING - toSize.height : toPos.y;
             const rightX = snap(gatewayPos.x + gatewaySize.width + GATEWAY_TO_ACTIVITY_GAP_X);
             const centeredX = snap(gatewayPos.x + gatewaySize.width / 2 - toSize.width / 2);
-            const slot = targets.length >= 2
-                ? (idx < slotOrder.length ? slotOrder[idx] : (idx % 2 === 0 ? "top" : "bottom"))
-                : "right";
+            const sameLane = entry.toStep?._roleId && gatewayStep?._roleId && entry.toStep._roleId === gatewayStep._roleId;
+            const slot = sameLane
+                ? "right"
+                : (aboveTargets.includes(entry) ? "top" : "bottom");
 
             if (slot === "right") {
                 toPos.x = rightX;
-                toPos.y = snap(Math.max(minY, Math.min(maxY, gatewayCenterY - toSize.height / 2)));
+                const rightIndex = sameLaneTargets.indexOf(entry);
+                const yOffset = rightIndex > 0 ? rightIndex * 18 : 0;
+                toPos.y = snap(Math.max(minY, Math.min(maxY, gatewayCenterY - toSize.height / 2 + yOffset)));
                 return;
             }
             // For top/bottom branches, place activity exactly above/below gateway center.
@@ -2582,6 +2706,46 @@ export function generateBPMN(process, options = {}) {
             toPos.y = snap(Math.max(minY, Math.min(maxY, preferredY)));
         });
     });
+
+    // Keep all core nodes in the same lane on one clean horizontal axis.
+    Object.entries(laneMeta).forEach(([roleId, lane]) => {
+        const laneCenterY = lane.y + lane.height / 2;
+        steps.forEach((step) => {
+            if (!step || step._isExternalActorStep || step._roleId !== roleId) return;
+            if (step.type === "boundaryTimer") return;
+            const pos = positions[step.id];
+            if (!pos) return;
+            const size = getNodeSize(step);
+            const minY = lane.y + LANE_PADDING;
+            const maxY = lane.y + lane.height - LANE_PADDING - size.height;
+            const alignedY = snap(laneCenterY - size.height / 2);
+            pos.y = snap(Math.max(minY, Math.min(maxY, alignedY)));
+        });
+    });
+
+    // Keep start event visible and inside the responsible internal lane.
+    const startPosFinal = positions[startId];
+    const startStepFinal = stepById.get(startId);
+    const firstFlowFinal = normalizedFlows.find((flow) => flow.from === startId);
+    if (startPosFinal && startStepFinal && firstFlowFinal && positions[firstFlowFinal.to]) {
+        const startSize = getNodeSize(startStepFinal);
+        const targetStep = stepById.get(firstFlowFinal.to);
+        const targetPos = positions[firstFlowFinal.to];
+        const targetSize = getNodeSize(targetStep);
+        const lane = laneMeta[startStepFinal._roleId] || laneMeta[targetStep?._roleId];
+        const minX = snap(LANE_X + LANE_SIDE_PADDING + 8);
+        const desiredX = snap(targetPos.x - Math.max(104, RANK_SPACING - 56));
+        startPosFinal.x = snap(Math.max(minX, desiredX));
+        const targetCenterY = targetPos.y + targetSize.height / 2;
+        const desiredY = snap(targetCenterY - startSize.height / 2);
+        if (lane) {
+            const minY = lane.y + LANE_PADDING;
+            const maxY = lane.y + lane.height - LANE_PADDING - startSize.height;
+            startPosFinal.y = snap(Math.max(minY, Math.min(maxY, desiredY)));
+        } else {
+            startPosFinal.y = desiredY;
+        }
+    }
 
     normalizedFlows.forEach((flow) => {
         const fromStep = stepById.get(flow.from);
@@ -2663,6 +2827,12 @@ export function generateBPMN(process, options = {}) {
         gatewayDefaultFlowByStepId.set(gatewayId, `flow_${defaultBranch.idx}`);
     });
 
+    const internalRolesOrdered = orderedRoles.filter((role) => !role.isExternal);
+    const externalRolesOrdered = orderedRoles.filter((role) => role.isExternal);
+    const externalParticipantIdByRoleId = new Map(
+        externalRolesOrdered.map((role) => [role.id, `Participant_External_${role.id}`])
+    );
+
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions
 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -2675,19 +2845,28 @@ id="Defs_1">
 <bpmn:process id="Process_1" isExecutable="false">`;
 
     xml += `<bpmn:laneSet id="LaneSet_1">`;
-    Object.values(roleMap).forEach((role) => {
+    internalRolesOrdered.forEach((role) => {
         xml += `<bpmn:lane id="Lane_${role.id}" name="${escapeXml(role.name)}">`;
-        role.steps.forEach((stepId) => {
+        role.steps
+            .filter((stepId) => !stepById.get(stepId)?._isExternalActorStep)
+            .forEach((stepId) => {
             xml += `<bpmn:flowNodeRef>${stepId}</bpmn:flowNodeRef>`;
-        });
+            });
         xml += `</bpmn:lane>`;
     });
     xml += `</bpmn:laneSet>`;
 
     steps.forEach((step) => {
-        const name = escapeXml(compactLabel(step.label || "undefined", 3));
+        const startLabel = step._messageStart ? "Nachricht\ngeht ein" : step.label;
+        const name = step._messageStart
+            ? escapeXml(startLabel || "undefined")
+            : escapeXml(compactLabel(startLabel || "undefined", 3));
         if (step.type === "startEvent") {
-            xml += `<bpmn:startEvent id="${step.id}" name="${name}" />`;
+            if (step._messageStart) {
+                xml += `<bpmn:startEvent id="${step.id}" name="${name}"><bpmn:messageEventDefinition /></bpmn:startEvent>`;
+            } else {
+                xml += `<bpmn:startEvent id="${step.id}" name="${name}" />`;
+            }
         } else if (step.type === "endEvent") {
             const endName = name === "undefined" ? "Ende" : name;
             xml += `<bpmn:endEvent id="${step.id}" name="${endName}" />`;
@@ -2711,22 +2890,36 @@ id="Defs_1">
     normalizedFlows.forEach((flow, i) => {
         const fromStep = stepById.get(flow.from);
         const toStep = stepById.get(flow.to);
+        const externalInfoFlow = Boolean(fromStep?._isExternalActorStep || toStep?._isExternalActorStep);
         const isInfoFlow = Boolean(
-            fromStep
-            && toStep
-            && isActivityLikeNode(fromStep)
-            && isActivityLikeNode(toStep)
-            && fromStep._roleId
-            && toStep._roleId
-            && fromStep._roleId !== toStep._roleId
+            externalInfoFlow || (
+                fromStep
+                && toStep
+                && isActivityLikeNode(fromStep)
+                && isActivityLikeNode(toStep)
+                && fromStep._roleId
+                && toStep._roleId
+                && fromStep._roleId !== toStep._roleId
+            )
         );
         if (isInfoFlow) {
             flowElementTypeByIndex.set(i, "association");
-            xml += `<bpmn:association id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}" associationDirection="One" />`;
+            const sourceRoleId = fromStep?._originalRoleId || fromStep?._roleId;
+            const targetRoleId = toStep?._originalRoleId || toStep?._roleId;
+            const sourceRef = fromStep?._isExternalActorStep
+                ? (externalParticipantIdByRoleId.get(sourceRoleId) || `Lane_${sourceRoleId}`)
+                : flow.from;
+            const targetRef = toStep?._isExternalActorStep
+                ? (externalParticipantIdByRoleId.get(targetRoleId) || `Lane_${targetRoleId}`)
+                : flow.to;
+            xml += `<bpmn:association id="flow_${i}" sourceRef="${sourceRef}" targetRef="${targetRef}" associationDirection="One" />`;
             return;
         }
         flowElementTypeByIndex.set(i, "sequenceFlow");
-        const name = flow.condition ? ` name="${escapeXml(flow.condition)}"` : "";
+        const displayCondition = fromStep?.type === "gateway"
+            ? normalizeGatewayOutgoingLabel(flow.condition)
+            : String(flow.condition || "");
+        const name = displayCondition ? ` name="${escapeXml(displayCondition)}"` : "";
         xml += `<bpmn:sequenceFlow id="flow_${i}" sourceRef="${flow.from}" targetRef="${flow.to}"${name} />`;
     });
 
@@ -2735,15 +2928,74 @@ id="Defs_1">
         xml += `<bpmn:textAnnotation id="${ann.id}"><bpmn:text>${ann.text}</bpmn:text></bpmn:textAnnotation>`;
         xml += `<bpmn:association id="${assocId}" sourceRef="${ann.id}" targetRef="${ann.attachTo}" />`;
     });
+    const startStep = steps.find((step) => step.id === startId);
+    const hasExternalStartMessage = Boolean(startStep?._messageStart && startStep?._messageSourceRoleId);
+    const externalStartAssociationId = hasExternalStartMessage ? "Association_ExternalStart" : "";
+    if (hasExternalStartMessage) {
+        const sourceExternalParticipant = externalParticipantIdByRoleId.get(startStep._messageSourceRoleId) || `Lane_${startStep._messageSourceRoleId}`;
+        xml += `<bpmn:association id="${externalStartAssociationId}" sourceRef="${sourceExternalParticipant}" targetRef="${startId}" associationDirection="One" />`;
+    }
 
-    xml += `</bpmn:process><bpmndi:BPMNDiagram><bpmndi:BPMNPlane bpmnElement="Process_1">`;
+    xml += `</bpmn:process>`;
+    xml += `<bpmn:collaboration id="Collaboration_1">`;
+    externalRolesOrdered.forEach((role) => {
+        const pid = externalParticipantIdByRoleId.get(role.id);
+        xml += `<bpmn:participant id="${pid}" name="${escapeXml(role.name)}" />`;
+    });
+    xml += `</bpmn:collaboration>`;
+    xml += `<bpmndi:BPMNDiagram><bpmndi:BPMNPlane bpmnElement="Collaboration_1">`;
 
-    Object.values(roleMap).forEach((role) => {
+    let internalPoolBounds = null;
+    if (internalRolesOrdered.length > 0) {
+        const internalTop = Math.min(...internalRolesOrdered.map((role) => laneMeta[role.id]?.y ?? Number.POSITIVE_INFINITY));
+        const internalBottom = Math.max(...internalRolesOrdered.map((role) => {
+            const meta = laneMeta[role.id];
+            return meta ? (meta.y + meta.height) : Number.NEGATIVE_INFINITY;
+        }));
+        if (Number.isFinite(internalTop) && Number.isFinite(internalBottom) && internalBottom > internalTop) {
+            internalPoolBounds = {
+                x: snap(LANE_X),
+                y: snap(internalTop),
+                width: snap(diagramWidth),
+                height: snap(internalBottom - internalTop)
+            };
+        }
+    }
+
+    externalRolesOrdered.forEach((role) => {
         const meta = laneMeta[role.id];
-        xml += `<bpmndi:BPMNShape bpmnElement="Lane_${role.id}" isHorizontal="true"><dc:Bounds x="${LANE_X}" y="${meta.y}" width="${diagramWidth}" height="${meta.height}" /></bpmndi:BPMNShape>`;
+        const pid = externalParticipantIdByRoleId.get(role.id);
+        if (!meta || !pid) return;
+        xml += `<bpmndi:BPMNShape bpmnElement="${pid}" isHorizontal="true" isExpanded="false"><dc:Bounds x="${LANE_X}" y="${meta.y}" width="${diagramWidth}" height="${meta.height}" /></bpmndi:BPMNShape>`;
+    });
+
+    const INTERNAL_HIERARCHY_INDENT = 0;
+    internalRolesOrdered.forEach((role) => {
+        const meta = laneMeta[role.id];
+        const poolX = internalPoolBounds ? internalPoolBounds.x : snap(LANE_X);
+        const poolWidth = internalPoolBounds ? internalPoolBounds.width : snap(diagramWidth);
+        const laneX = snap(poolX + INTERNAL_HIERARCHY_INDENT);
+        const laneWidth = snap(Math.max(120, poolWidth - INTERNAL_HIERARCHY_INDENT));
+        xml += `<bpmndi:BPMNShape bpmnElement="Lane_${role.id}" isHorizontal="true"><dc:Bounds x="${laneX}" y="${snap(meta.y)}" width="${laneWidth}" height="${snap(meta.height)}" /></bpmndi:BPMNShape>`;
     });
 
     const stepsById = new Map(steps.map((step) => [step.id, step]));
+    // Final strict lane alignment so gateways/tasks/events share one axis.
+    Object.entries(laneMeta).forEach(([roleId, lane]) => {
+        const laneCenterY = lane.y + lane.height / 2;
+        steps.forEach((step) => {
+            if (!step || step._isExternalActorStep || step._roleId !== roleId) return;
+            if (step.type === "boundaryTimer") return;
+            const pos = positions[step.id];
+            if (!pos) return;
+            const size = getNodeSize(step);
+            const minY = lane.y + LANE_PADDING;
+            const maxY = lane.y + lane.height - LANE_PADDING - size.height;
+            const alignedY = snap(laneCenterY - size.height / 2);
+            pos.y = snap(Math.max(minY, Math.min(maxY, alignedY)));
+        });
+    });
+
     normalizedFlows.forEach((flow) => {
         const fromStep = stepsById.get(flow.from);
         const toStep = stepsById.get(flow.to);
@@ -2757,6 +3009,7 @@ id="Defs_1">
         );
     });
     steps.forEach((step) => {
+        if (step._isExternalActorStep) return;
         const pos = positions[step.id];
         const { width, height } = getNodeSize(step);
         const labelText = compactLabel(step.label || "undefined", 3);
@@ -2846,26 +3099,40 @@ id="Defs_1">
             });
             const gatewayEdgeByFlowIndex = new Map();
             outgoingByGateway.forEach((list, gatewayId) => {
-                void gatewayId;
-                const sorted = [...list].sort((a, b) => {
-                    const toA = positions[a.flow.to];
-                    const toB = positions[b.flow.to];
-                    const yA = toA ? toA.y : 0;
-                    const yB = toB ? toB.y : 0;
-                    return yA - yB;
-                });
-                const preferredOrder = ["right", "top", "bottom"];
-                sorted.forEach((entry, localIdx) => {
-                    gatewayEdgeByFlowIndex.set(entry.idx, preferredOrder[Math.min(localIdx, preferredOrder.length - 1)]);
+                const gatewayPos = positions[gatewayId];
+                const gatewayStep = stepsById.get(gatewayId);
+                if (!gatewayPos || !gatewayStep) return;
+                const gatewaySize = getNodeSize(gatewayStep);
+                const gatewayCenterY = gatewayPos.y + gatewaySize.height / 2;
+                list.forEach((entry) => {
+                    const toStep = stepsById.get(entry.flow.to);
+                    const toPos = positions[entry.flow.to];
+                    if (!toStep || !toPos || !isActivityLike(toStep)) {
+                        gatewayEdgeByFlowIndex.set(entry.idx, "right");
+                        return;
+                    }
+                    const sameLane = Boolean(toStep._roleId && gatewayStep._roleId && toStep._roleId === gatewayStep._roleId);
+                    if (sameLane) {
+                        gatewayEdgeByFlowIndex.set(entry.idx, "right");
+                        return;
+                    }
+                    const toSize = getNodeSize(toStep);
+                    const targetCenterY = toPos.y + toSize.height / 2;
+                    gatewayEdgeByFlowIndex.set(entry.idx, targetCenterY < gatewayCenterY ? "top" : "bottom");
                 });
             });
 
+            const forceStraightFlowIndexes = new Set();
             const hardWaypoints = normalizedFlows.map((flow, idx) => {
                 const fromPos = positions[flow.from];
                 const toPos = positions[flow.to];
                 const fromStep = stepsById.get(flow.from);
                 const toStep = stepsById.get(flow.to);
                 if (!fromPos || !toPos || !fromStep || !toStep) return [];
+                const fromExternalLane = fromStep?._originalRoleId ? laneMeta[fromStep._originalRoleId] : null;
+                const toExternalLane = toStep?._originalRoleId ? laneMeta[toStep._originalRoleId] : null;
+                const fromIsExternalStep = Boolean(fromStep?._isExternalActorStep && fromExternalLane);
+                const toIsExternalStep = Boolean(toStep?._isExternalActorStep && toExternalLane);
                 const fromSize = getNodeSize(fromStep);
                 const toSize = getNodeSize(toStep);
                 const gatewayOutEdge = gatewayEdgeByFlowIndex.get(idx);
@@ -2876,7 +3143,10 @@ id="Defs_1">
                 const targetIsBelow = toCenterY > fromCenterY + 8;
                 const verticalTargetEntry = targetIsAbove || targetIsBelow;
 
-                const start = fromStep.type === "gateway"
+                const externalAnchorX = snap(LANE_X + 96);
+                const start = fromIsExternalStep
+                    ? { x: externalAnchorX, y: snap(fromExternalLane.y + fromExternalLane.height) }
+                    : fromStep.type === "gateway"
                     ? (
                         gatewayOutEdge === "top"
                             ? { x: snap(fromPos.x + fromSize.width / 2), y: snap(fromPos.y) }
@@ -2887,7 +3157,9 @@ id="Defs_1">
                     : { x: snap(fromPos.x + fromSize.width), y: snap(fromPos.y + fromSize.height / 2) };
 
                 // Gateway incoming flows must enter from the left edge.
-                const end = toStep.type === "gateway"
+                const end = toIsExternalStep
+                    ? { x: externalAnchorX, y: snap(toExternalLane.y + toExternalLane.height) }
+                    : toStep.type === "gateway"
                     ? { x: snap(toPos.x), y: snap(toPos.y + toSize.height / 2) }
                     : verticalTargetEntry && isActivityLike(toStep)
                         ? (
@@ -2896,6 +3168,42 @@ id="Defs_1">
                                 : { x: snap(toPos.x + toSize.width / 2), y: snap(toPos.y) } // enter at top edge
                         )
                     : { x: snap(toPos.x), y: snap(toPos.y + toSize.height / 2) };
+
+                const sameLaneFlow = Boolean(
+                    fromStep?._roleId
+                    && toStep?._roleId
+                    && fromStep._roleId === toStep._roleId
+                );
+                const isBackLike = Boolean(flow._isBackEdge) || end.x <= start.x + 24;
+                if (!fromIsExternalStep && !toIsExternalStep && sameLaneFlow && !isBackLike && Math.abs(start.y - end.y) <= 2) {
+                    forceStraightFlowIndexes.add(idx);
+                    return clampPath([start, end]);
+                }
+                if (!fromIsExternalStep && !toIsExternalStep && !isBackLike && Math.abs(start.x - end.x) <= 2) {
+                    forceStraightFlowIndexes.add(idx);
+                    return clampPath([start, end]);
+                }
+
+                // Internal activity sending information to external role:
+                // start at top center of activity and route straight up.
+                if (!fromIsExternalStep && toIsExternalStep && isActivityLike(fromStep)) {
+                    const verticalStart = { x: snap(fromPos.x + fromSize.width / 2), y: snap(fromPos.y) };
+                    const verticalEnd = {
+                        x: verticalStart.x,
+                        y: snap(toExternalLane.y + toExternalLane.height)
+                    };
+                    forceStraightFlowIndexes.add(idx);
+                    return clampPath([verticalStart, verticalEnd]);
+                }
+                // External -> internal information flow should be a strict
+                // vertical connector into the internal target.
+                if (fromIsExternalStep && !toIsExternalStep) {
+                    const verticalX = snap(end.x);
+                    const verticalStart = { x: verticalX, y: start.y };
+                    const verticalEnd = { x: verticalX, y: end.y };
+                    forceStraightFlowIndexes.add(idx);
+                    return clampPath([verticalStart, verticalEnd]);
+                }
 
                 if (fromStep.type === "startEvent" && !Boolean(flow._isBackEdge)) {
                     if (start.y === end.y) return [start, end];
@@ -2933,8 +3241,8 @@ id="Defs_1">
                     ]);
                 }
 
-                const isBackLike = Boolean(flow._isBackEdge) || end.x <= start.x + 24;
-                if (isBackLike) {
+                const isBackLike2 = Boolean(flow._isBackEdge) || end.x <= start.x + 24;
+                if (isBackLike2) {
                     const railY = snap(Math.max(flowMinY, flowMaxY - 12 - (idx % 6) * 12));
                     const exitX = snap(start.x + 24);
                     const entryX = snap(Math.max(laneBounds.minX + 24, end.x - 24));
@@ -2966,7 +3274,8 @@ id="Defs_1">
                 laneBounds,
                 stepsById
             );
-            return enforceOrthogonalWaypoints(reduced, normalizedFlows, stepsById);
+            const restoredStraight = reduced.map((points, i) => (forceStraightFlowIndexes.has(i) ? hardWaypoints[i] : points));
+            return enforceOrthogonalWaypoints(restoredStraight, normalizedFlows, stepsById);
         })()
         : (() => {
             let refinedWaypoints = flowWaypoints.map((points) => points.map((p) => ({ ...p })));
@@ -3039,25 +3348,128 @@ id="Defs_1">
                 stepsById
             );
         })();
+    const enforceFinalAxisAlignedFlows = finalRenderWaypoints.map((points, i) => {
+        const flow = normalizedFlows[i];
+        const fromStep = stepsById.get(flow?.from);
+        const toStep = stepsById.get(flow?.to);
+        const fromPos = flow ? positions[flow.from] : null;
+        const toPos = flow ? positions[flow.to] : null;
+        if (!flow || !fromStep || !toStep || !fromPos || !toPos) return points;
+        const fromSize = getNodeSize(fromStep);
+        const toSize = getNodeSize(toStep);
+        const fromCenter = {
+            x: snap(fromPos.x + fromSize.width / 2),
+            y: snap(fromPos.y + fromSize.height / 2)
+        };
+        const toCenter = {
+            x: snap(toPos.x + toSize.width / 2),
+            y: snap(toPos.y + toSize.height / 2)
+        };
+        let start = { x: fromCenter.x, y: fromCenter.y };
+        let end = { x: toCenter.x, y: toCenter.y };
+        const fromExternalLane = fromStep?._originalRoleId ? laneMeta[fromStep._originalRoleId] : null;
+        const toExternalLane = toStep?._originalRoleId ? laneMeta[toStep._originalRoleId] : null;
+        const fromIsExternal = Boolean(fromStep?._isExternalActorStep && fromExternalLane);
+        const toIsExternal = Boolean(toStep?._isExternalActorStep && toExternalLane);
+        const sameLane = Boolean(fromStep?._roleId && toStep?._roleId && fromStep._roleId === toStep._roleId);
+        if (fromIsExternal && !toIsExternal) {
+            const x = snap(toPos.x + toSize.width / 2);
+            start = { x, y: snap(fromExternalLane.y + fromExternalLane.height) };
+            end = { x, y: snap(toPos.y) };
+            return [start, end];
+        } else if (!fromIsExternal && toIsExternal) {
+            const x = snap(fromPos.x + fromSize.width / 2);
+            start = { x, y: snap(fromPos.y) };
+            end = { x, y: snap(toExternalLane.y + toExternalLane.height) };
+            return [start, end];
+        }
+
+        const dx = toCenter.x - fromCenter.x;
+        const dy = toCenter.y - fromCenter.y;
+        // Hard final rule: horizontal flows left->right, vertical flows up/down.
+        if (sameLane || Math.abs(dx) >= Math.abs(dy)) {
+            const lane = sameLane ? laneMeta[fromStep._roleId] : null;
+            const forcedY = lane ? snap(lane.y + lane.height / 2) : fromCenter.y;
+            if (dx >= 0) {
+                start = { x: snap(fromPos.x + fromSize.width), y: forcedY };
+                end = { x: snap(toPos.x), y: forcedY };
+            } else {
+                start = { x: snap(fromPos.x), y: forcedY };
+                end = { x: snap(toPos.x + toSize.width), y: forcedY };
+            }
+        } else {
+            if (dy >= 0) {
+                start = { x: fromCenter.x, y: snap(fromPos.y + fromSize.height) };
+                end = { x: fromCenter.x, y: snap(toPos.y) };
+            } else {
+                start = { x: fromCenter.x, y: snap(fromPos.y) };
+                end = { x: fromCenter.x, y: snap(toPos.y + toSize.height) };
+            }
+        }
+        return [start, end];
+    });
+
     normalizedFlows.forEach((flow, i) => {
-        const waypoints = compactOrthogonalWaypoints(finalRenderWaypoints[i] || []);
+        const waypoints = compactOrthogonalWaypoints(enforceFinalAxisAlignedFlows[i] || []);
         if (!waypoints || waypoints.length === 0) return;
         const waypointXml = waypoints
             .map((point) => `<di:waypoint x="${snap(point.x)}" y="${snap(point.y)}" />`)
             .join("");
         const fromStep = stepsById.get(flow.from);
         const isSequenceFlow = flowElementTypeByIndex.get(i) === "sequenceFlow";
-        const hasConditionLabel = isSequenceFlow && Boolean(flow.condition);
+        const displayCondition = fromStep?.type === "gateway"
+            ? normalizeGatewayOutgoingLabel(flow.condition)
+            : String(flow.condition || "");
+        const hasConditionLabel = isSequenceFlow && Boolean(displayCondition);
         const branchKind = classifyBranchLabel(flow.condition);
         const labelAnchor = fromStep?.type === "gateway"
-            ? (
-                branchKind === "error"
-                    ? (waypoints[2] || waypoints[1] || waypoints[0])
-                    : (waypoints[1] || waypoints[0])
-            )
+            ? (() => {
+                const start = waypoints[0] || { x: 0, y: 0 };
+                const next = waypoints[1] || start;
+                const dx = next.x - start.x;
+                const dy = next.y - start.y;
+                // Keep outgoing condition labels close to the gateway.
+                if (dx > 0 && Math.abs(dy) <= 2) {
+                    return {
+                        x: snap(start.x + 4),
+                        y: snap(start.y - 8)
+                    };
+                }
+                return {
+                    x: snap(start.x + (dx === 0 ? 0 : (dx > 0 ? 22 : -22))),
+                    y: snap(start.y + (dy === 0 ? -10 : (dy > 0 ? 14 : -14)))
+                };
+            })()
             : waypoints[0];
-        const labelWidth = Math.max(48, Math.min(180, String(flow.condition || "").length * 7));
-        const labelBounds = placeEdgeLabelBounds(labelAnchor, labelWidth, 18, stepRects, 0);
+        const labelWidth = Math.max(48, Math.min(180, String(displayCondition || "").length * 7));
+        const labelHeight = 18;
+        const labelBounds = fromStep?.type === "gateway"
+            ? (() => {
+                const start = waypoints[0] || { x: 0, y: 0 };
+                const next = waypoints[1] || start;
+                const dx = next.x - start.x;
+                const dy = next.y - start.y;
+                // Vertical branch labels: right of flow, close to gateway.
+                if (Math.abs(dx) <= 2) {
+                    return {
+                        x: snap(start.x + 8),
+                        y: snap(start.y - 8),
+                        width: labelWidth,
+                        height: labelHeight
+                    };
+                }
+                // Right-going branch labels: above flow, close to gateway.
+                if (dx > 0 && Math.abs(dy) <= 2) {
+                    return {
+                        x: snap(start.x + 4),
+                        y: snap(start.y - 18),
+                        width: labelWidth,
+                        height: labelHeight
+                    };
+                }
+                return placeEdgeLabelBounds(labelAnchor, labelWidth, labelHeight, stepRects, 0);
+            })()
+            : placeEdgeLabelBounds(labelAnchor, labelWidth, labelHeight, stepRects, 0);
         const labelXml = hasConditionLabel
             ? `<bpmndi:BPMNLabel><dc:Bounds x="${labelBounds.x}" y="${labelBounds.y}" width="${labelBounds.width}" height="${labelBounds.height}" /></bpmndi:BPMNLabel>`
             : "";
@@ -3075,6 +3487,18 @@ id="Defs_1">
         const assocId = `Association_${ann.id}`;
         xml += `<bpmndi:BPMNEdge bpmnElement="${assocId}"><di:waypoint x="${x1}" y="${y1}" /><di:waypoint x="${x2}" y="${y2}" /></bpmndi:BPMNEdge>`;
     });
+    if (hasExternalStartMessage) {
+        const sourceLane = laneMeta[startStep._messageSourceRoleId];
+        const targetPos = positions[startId];
+        const targetSize = getNodeSize(startStep);
+        if (sourceLane && targetPos && targetSize) {
+            const tx = snap(targetPos.x + targetSize.width / 2);
+            const ty = snap(targetPos.y);
+            const sx = tx;
+            const sy = snap(sourceLane.y + sourceLane.height);
+            xml += `<bpmndi:BPMNEdge bpmnElement="${externalStartAssociationId}"><di:waypoint x="${sx}" y="${sy}" /><di:waypoint x="${tx}" y="${ty}" /></bpmndi:BPMNEdge>`;
+        }
+    }
 
     xml += `</bpmndi:BPMNPlane></bpmndi:BPMNDiagram></bpmn:definitions>`;
     return xml;
