@@ -63,6 +63,13 @@ const escapeHtml = (value) => String(value)
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const tokenizeWords = (input) => String(input || "").match(/[\p{L}][\p{L}\p{N}-]*/gu) || [];
 const normalizeWord = (word) => String(word || "").toLowerCase().trim();
+const normalizeEditorText = (value) => String(value || "")
+    .replace(/\r/g, "")
+    .replace(/[^\S\n]+/g, " ")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .trim();
 const parseSseEventChunk = (rawChunk = "") => {
     const lines = String(rawChunk || "").split(/\r?\n/);
     let event = "message";
@@ -454,8 +461,8 @@ function App() {
     }, [xml]);
 
     const runAnalysis = async (inputText) => {
-        const trimmedText = String(inputText || "").trim();
-        if (trimmedText.length < 5) {
+        const cleanedText = normalizeEditorText(inputText);
+        if (cleanedText.length < 5) {
             setError("Bitte gib mindestens 5 Zeichen ein.");
             return;
         }
@@ -466,7 +473,7 @@ function App() {
         setStatus(useAiOptimization ? "Optimiere Text fuer KI-Analyse..." : "Analysiere Prozess...");
         setIsLoading(true);
         try {
-            let analysisText = trimmedText;
+            let analysisText = cleanedText;
             if (useAiOptimization) {
                 try {
                     const optimizeRes = await fetch(`${API_BASE_URL}/api/optimize`, {
@@ -474,7 +481,7 @@ function App() {
                         headers: {
                             "Content-Type": "application/json"
                         },
-                        body: JSON.stringify({ text: trimmedText })
+                        body: JSON.stringify({ text: cleanedText })
                     });
                     const optimizeData = await optimizeRes.json();
                     if (optimizeRes.ok && optimizeData.success && optimizeData.optimizedText) {
@@ -583,7 +590,11 @@ function App() {
     };
 
     const handleAnalyze = async () => {
-        await runAnalysis(text);
+        const cleanedText = normalizeEditorText(text);
+        if (cleanedText !== text) {
+            setText(cleanedText);
+        }
+        await runAnalysis(cleanedText);
     };
 
     const relayoutCurrentDiagram = async () => {
@@ -893,6 +904,31 @@ function App() {
                 });
                 if (!fixed) break;
             }
+
+            // Compact excessive horizontal gaps within each visual row.
+            // This keeps empty stretches small while preserving node order.
+            const COMPACT_BASE_GAP = 44;
+            const COMPACT_GATEWAY_GAP = 64;
+            byRow.forEach((bucketNodes) => {
+                const sorted = bucketNodes
+                    .slice()
+                    .sort((a, b) => (targetPosById.get(a.id)?.x || a.x) - (targetPosById.get(b.id)?.x || b.x));
+                for (let i = 1; i < sorted.length; i += 1) {
+                    const prev = sorted[i - 1];
+                    const curr = sorted[i];
+                    const prevPos = targetPosById.get(prev.id);
+                    const currPos = targetPosById.get(curr.id);
+                    if (!prevPos || !currPos) continue;
+
+                    const touchesGatewayCluster = isGatewayClusterNode(prev) || isGatewayClusterNode(curr);
+                    const compactGap = touchesGatewayCluster ? COMPACT_GATEWAY_GAP : COMPACT_BASE_GAP;
+                    const desiredX = prevPos.x + prev.width + compactGap;
+
+                    if (currPos.x > desiredX) {
+                        currPos.x = desiredX;
+                    }
+                }
+            });
         });
 
         // Absolute final no-overlap pass per lane: if anything still overlaps,
@@ -956,13 +992,16 @@ function App() {
             setStatus("Layout erfolgreich neu angeordnet.");
             return;
         }
-        const trimmedText = String(text || "").trim();
-        if (trimmedText.length < 5) {
+        const cleanedText = normalizeEditorText(text);
+        if (cleanedText.length < 5) {
             setError("Für Neu-Anordnung bitte zuerst einen Prozess-Text eingeben.");
             setStatus("Neu-Anordnung fehlgeschlagen.");
             return;
         }
-        await runAnalysis(trimmedText);
+        if (cleanedText !== text) {
+            setText(cleanedText);
+        }
+        await runAnalysis(cleanedText);
     };
 
     const extractTextFromPdf = async (file) => {
@@ -1058,10 +1097,11 @@ function App() {
             return;
         }
 
-        setText(extractedText);
+        const cleanedText = normalizeEditorText(extractedText);
+        setText(cleanedText);
         setStatus(`Text aus ${fileName} erfolgreich geladen.`);
         setIsExtractingDocument(false);
-        await runAnalysis(extractedText);
+        await runAnalysis(cleanedText);
     };
 
     const handleUploadDocument = async (event) => {
