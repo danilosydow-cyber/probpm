@@ -67,7 +67,16 @@ export function createGenerateRouter({
                     
                     // Schritt 1: Textanalyse
                     sendUpdate('progress', { step: 'analyze', message: 'Text wird analysiert...', progress: 10 });
-                    const processJson = await analyzeText(req.validatedText);
+                    const processJson = await analyzeText(req.validatedText, {
+                        onProgress: (evt) => {
+                            sendUpdate("progress", {
+                                step: evt?.step || "analyze_detail",
+                                message: evt?.message || "Analyse-Schritt...",
+                                progress: 12,
+                                data: evt?.data || null
+                            });
+                        }
+                    });
                     sendUpdate('progress', { step: 'analyze_complete', message: 'Textanalyse abgeschlossen', progress: 30, data: { steps: processJson.steps?.length || 0 } });
                     
                     // Schritt 2: BPMN-Generierung

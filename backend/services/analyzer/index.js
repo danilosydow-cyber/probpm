@@ -6,6 +6,7 @@ import { getBpmnKnowledgeBase } from "../bpmnKnowledgeBase.js";
 import { buildLearningGuidanceText } from "../bpmnQualityLearning.js";
 import {
     buildAnalyzePrompt,
+    buildRepairPrompt,
     buildOptimizationGuidanceFromKnowledgeBase,
     buildOptimizationPrompt
 } from "./prompt.js";
@@ -28,6 +29,7 @@ function getOpenAiClient() {
 const ANALYZE_TIMEOUT_MS = Number(process.env.ANALYZE_TIMEOUT_MS || 35000);
 const OPTIMIZE_TIMEOUT_MS = Number(process.env.OPTIMIZE_TIMEOUT_MS || 20000);
 const ANALYZE_MAX_RETRIES = Number(process.env.ANALYZE_MAX_RETRIES || 1);
+const ANALYZE_REPAIR_MAX_RETRIES = Number(process.env.ANALYZE_REPAIR_MAX_RETRIES || 1);
 const OPTIMIZE_MAX_RETRIES = Number(process.env.OPTIMIZE_MAX_RETRIES || 1);
 const AMBIGUITY_FLAGS = Object.freeze({
     MISSING_ROLE: "MISSING_ROLE",
@@ -100,6 +102,141 @@ function extractStatusHint(step, sourceText = "") {
     if (/\b(geprueft|geprüft|validiert)\b/.test(haystack)) return "geprueft";
     if (/\b(offen|wartet|ausstehend)\b/.test(haystack)) return "offen";
     return "";
+}
+
+function sanitizeParsedFlowTargets(processJson) {
+    if (!processJson || typeof processJson !== "object") return processJson;
+    const steps = Array.isArray(processJson.steps) ? processJson.steps : [];
+    const validIds = new Set(
+        steps
+            .map((step) => String(step?.id || "").trim())
+            .filter(Boolean)
+    );
+
+    processJson.steps = steps.map((step) => {
+        const next = (Array.isArray(step?.next) ? step.next : [])
+            .filter((target) => typeof target === "string" && validIds.has(target));
+        const conditions = (Array.isArray(step?.conditions) ? step.conditions : [])
+            .filter((cond) => typeof cond?.target === "string" && validIds.has(cond.target))
+            .map((cond) => ({
+                ...cond,
+                target: String(cond.target).trim()
+            }));
+        return {
+            ...step,
+            next,
+            conditions
+        };
+    });
+    return processJson;
+}
+
+function emitAnalyzeProgress(onProgress, payload) {
+    if (typeof onProgress !== "function") return;
+    try {
+        onProgress({
+            timestamp: Date.now(),
+            ...payload
+        });
+    } catch (_err) {
+        // Progress reporting must never break analysis flow.
+    }
+}
+
+function collectModelingIssues(processJson) {
+    const issues = [];
+    const steps = Array.isArray(processJson?.steps) ? processJson.steps : [];
+    const roleSet = new Set((Array.isArray(processJson?.roles) ? processJson.roles : []).map((r) => String(r || "").trim()));
+    const idSet = new Set(steps.map((step) => String(step?.id || "").trim()).filter(Boolean));
+    const incomingCount = new Map();
+
+    steps.forEach((step) => {
+        (Array.isArray(step?.next) ? step.next : []).forEach((target) => {
+            incomingCount.set(target, (incomingCount.get(target) || 0) + 1);
+        });
+        (Array.isArray(step?.conditions) ? step.conditions : []).forEach((cond) => {
+            const target = String(cond?.target || "").trim();
+            if (!target) return;
+            incomingCount.set(target, (incomingCount.get(target) || 0) + 1);
+        });
+    });
+
+    steps.forEach((step) => {
+        const id = String(step?.id || "").trim();
+        const type = String(step?.type || "task").trim().toLowerCase();
+        const next = Array.isArray(step?.next) ? step.next : [];
+        const conditions = Array.isArray(step?.conditions) ? step.conditions : [];
+        const role = String(step?.role || "").trim();
+
+        if (role && !roleSet.has(role)) {
+            issues.push(`Step ${id}: Rolle "${role}" ist nicht in roles enthalten`);
+        }
+
+        if (type === "gateway") {
+            if (conditions.length < 2) {
+                issues.push(`Step ${id}: Gateway braucht mindestens 2 Bedingungen`);
+            }
+            const seenTargets = new Set();
+            conditions.forEach((cond, idx) => {
+                const label = String(cond?.label || "").trim();
+                const target = String(cond?.target || "").trim();
+                if (!label) issues.push(`Step ${id}: Bedingung ${idx + 1} hat kein Label`);
+                if (!target || !idSet.has(target)) issues.push(`Step ${id}: Bedingung ${idx + 1} zeigt auf ungueltiges Ziel`);
+                if (target && seenTargets.has(target)) issues.push(`Step ${id}: mehrere Bedingungen zeigen auf dasselbe Ziel (${target})`);
+                if (target) seenTargets.add(target);
+            });
+            if (next.length > 0) {
+                issues.push(`Step ${id}: Gateway darf kein next-Feld mit Kanten haben`);
+            }
+        } else if (type === "end") {
+            if (next.length > 0 || conditions.length > 0) {
+                issues.push(`Step ${id}: End Event darf keine ausgehenden Kanten haben`);
+            }
+        } else {
+            if (conditions.length > 0) {
+                issues.push(`Step ${id}: Task darf keine conditions enthalten`);
+            }
+            if (next.length === 0) {
+                issues.push(`Step ${id}: Task ohne next-Ziel`);
+            }
+        }
+    });
+
+    const endCount = steps.filter((step) => String(step?.type || "").trim().toLowerCase() === "end").length;
+    if (endCount < 1) {
+        issues.push("Modell braucht mindestens ein End Event");
+    }
+    const rootSteps = steps.filter((step) => (incomingCount.get(step?.id) || 0) === 0);
+    if (rootSteps.length !== 1) {
+        issues.push(`Modell braucht genau einen fachlichen Einstieg (gefunden: ${rootSteps.length})`);
+    }
+
+    return [...new Set(issues)];
+}
+
+function finalizeAnalyzedProcess(parsed, sourceText = "") {
+    sanitizeParsedFlowTargets(parsed);
+    prevalidateSemanticProcess(parsed);
+    const semanticIR = buildSemanticIRFromProcess(parsed, sourceText);
+    const withIR = {
+        ...parsed,
+        _semanticIR: semanticIR,
+        _ambiguityFlags: [
+            ...(Array.isArray(semanticIR?.processFlags) ? semanticIR.processFlags : []),
+            ...semanticIR.steps.flatMap((step) => step.ambiguityFlags || [])
+        ]
+    };
+    const modelingIssues = collectModelingIssues(withIR);
+    if (modelingIssues.length > 0) {
+        throw new AppError(
+            "MODELING_RULE_VIOLATION",
+            modelingIssues.slice(0, 8).join("; "),
+            422,
+            { issues: modelingIssues }
+        );
+    }
+    validateProcessShape(withIR);
+    return normalizeProcessJson(withIR);
 }
 
 export function prevalidateSemanticProcess(processJson) {
@@ -246,7 +383,8 @@ async function callChatWithTimeout({
     throw lastError;
 }
 
-export async function analyzeTextToProcess(text) {
+export async function analyzeTextToProcess(text, options = {}) {
+    const onProgress = typeof options?.onProgress === "function" ? options.onProgress : null;
     const trimmed = typeof text === "string" ? text.trim() : "";
     if (!trimmed || trimmed.length < MIN_PROCESS_TEXT_CHARS) {
         throw badRequest("Text zu kurz fuer Analyse", { minLength: MIN_PROCESS_TEXT_CHARS }, "TEXT_TOO_SHORT");
@@ -258,8 +396,16 @@ export async function analyzeTextToProcess(text) {
     const learningGuidance = buildLearningGuidanceText();
     const preparedText = normalizeInputForBpmn(trimmed);
     const prompt = buildAnalyzePrompt(preparedText, learningGuidance);
+    emitAnalyzeProgress(onProgress, {
+        step: "analyze_prepare_input",
+        message: "Eingabetext normalisiert"
+    });
 
     try {
+        emitAnalyzeProgress(onProgress, {
+            step: "analyze_llm_request",
+            message: "LLM-Analyse wird ausgefuehrt"
+        });
         const response = await callChatWithTimeout({
             operation: "analyze",
             timeoutMs: ANALYZE_TIMEOUT_MS,
@@ -279,19 +425,79 @@ export async function analyzeTextToProcess(text) {
         });
 
         const content = response?.choices?.[0]?.message?.content;
-        const parsed = parseAnalyzerResponse(content);
-        prevalidateSemanticProcess(parsed);
-        const semanticIR = buildSemanticIRFromProcess(parsed, preparedText);
-        const withIR = {
-            ...parsed,
-            _semanticIR: semanticIR,
-            _ambiguityFlags: [
-                ...(Array.isArray(semanticIR?.processFlags) ? semanticIR.processFlags : []),
-                ...semanticIR.steps.flatMap((step) => step.ambiguityFlags || [])
-            ]
-        };
-        validateProcessShape(withIR);
-        return normalizeProcessJson(withIR);
+        let parsed = parseAnalyzerResponse(content);
+        emitAnalyzeProgress(onProgress, {
+            step: "analyze_parse_response",
+            message: "LLM-Antwort in JSON geparst"
+        });
+
+        for (let repairAttempt = 0; repairAttempt <= ANALYZE_REPAIR_MAX_RETRIES; repairAttempt += 1) {
+            try {
+                emitAnalyzeProgress(onProgress, {
+                    step: "analyze_validate_model",
+                    message: repairAttempt > 0
+                        ? `Validierung nach Reparatur ${repairAttempt}`
+                        : "Struktur- und Modellregeln werden validiert"
+                });
+                const finalized = finalizeAnalyzedProcess(parsed, preparedText);
+                emitAnalyzeProgress(onProgress, {
+                    step: "analyze_complete",
+                    message: "Analyse-JSON ist gueltig",
+                    data: {
+                        roles: Array.isArray(finalized?.roles) ? finalized.roles.length : 0,
+                        steps: Array.isArray(finalized?.steps) ? finalized.steps.length : 0,
+                        repairsUsed: repairAttempt
+                    }
+                });
+                return finalized;
+            } catch (validationError) {
+                const isLastAttempt = repairAttempt >= ANALYZE_REPAIR_MAX_RETRIES;
+                if (isLastAttempt || !(validationError instanceof AppError)) {
+                    throw validationError;
+                }
+
+                const explicitIssues = Array.isArray(validationError?.details?.issues)
+                    ? validationError.details.issues
+                    : [];
+                const fallbackIssue = `${validationError.code || "VALIDATION_ERROR"}: ${validationError.message || "Unbekannter Fehler"}`;
+                const repairPrompt = buildRepairPrompt({
+                    sourceText: preparedText,
+                    previousJson: parsed,
+                    validationErrors: explicitIssues.length > 0 ? explicitIssues : [fallbackIssue],
+                    learningGuidance
+                });
+                emitAnalyzeProgress(onProgress, {
+                    step: "analyze_repair_attempt",
+                    message: `Reparaturversuch ${repairAttempt + 1} gestartet`,
+                    data: {
+                        issueCount: explicitIssues.length > 0 ? explicitIssues.length : 1
+                    }
+                });
+                const repairResponse = await callChatWithTimeout({
+                    operation: "analyze_repair",
+                    timeoutMs: ANALYZE_TIMEOUT_MS,
+                    maxRetries: 0,
+                    model: "gpt-4.1",
+                    temperature: 0,
+                    messages: [
+                        {
+                            role: "system",
+                            content: "Du reparierst BPMN-JSON strikt nach Validierungsregeln."
+                        },
+                        {
+                            role: "user",
+                            content: repairPrompt
+                        }
+                    ]
+                });
+                parsed = parseAnalyzerResponse(repairResponse?.choices?.[0]?.message?.content);
+                emitAnalyzeProgress(onProgress, {
+                    step: "analyze_repair_complete",
+                    message: `Reparaturversuch ${repairAttempt + 1} abgeschlossen`
+                });
+            }
+        }
+        throw new AppError("ANALYZE_FAILED", "Analyse fehlgeschlagen", 500);
     } catch (error) {
         if (error instanceof AppError) throw error;
         console.error(error);

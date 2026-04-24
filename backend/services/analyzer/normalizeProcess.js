@@ -23,6 +23,13 @@ function classifyConditionLabel(label) {
     return "other";
 }
 
+function complementaryBranchLabel(existingLabel) {
+    const kind = classifyConditionLabel(existingLabel);
+    if (kind === "yes") return "Nein";
+    if (kind === "no") return "Ja";
+    return "Nein";
+}
+
 function buildConsistentRoles(json) {
     const knownRoles = [];
     const roleIndex = new Map();
@@ -357,7 +364,7 @@ function applyBpmnStandards(json) {
         if (mode === "gateway") {
             sourceStep.conditions = [
                 ...(Array.isArray(sourceStep.conditions) ? sourceStep.conditions : []),
-                { label: "Weiter", target: endId }
+                { label: "Nein", target: endId }
             ];
         } else {
             sourceStep.next = [endId];
@@ -387,6 +394,19 @@ function applyBpmnStandards(json) {
                     deduped[0].label = "Ja";
                     deduped[1].label = "Nein";
                 }
+            }
+            if (deduped.length === 1) {
+                const syntheticTarget = nextSyntheticEndId();
+                steps.push({
+                    id: syntheticTarget,
+                    type: "end",
+                    label: "Ende",
+                    role: step.role
+                });
+                deduped.push({
+                    label: complementaryBranchLabel(deduped[0].label),
+                    target: syntheticTarget
+                });
             }
             step.next = [];
             step.conditions = deduped;

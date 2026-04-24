@@ -82,14 +82,27 @@ WICHTIG:
 - KEINE doppelten IDs, KEINE null Werte
 - Dieselbe realweltliche Aktivitaet nur EINMAL als Step; bei Wiederholung bestehenden Task per Kante nutzen
 - BPMN-Best-Practice:
+  - BPMN-KERNREGELN (verbindlich):
+  - Das Modell startet fachlich mit genau einem Einstiegspfad; technische StartEvents werden spaeter erzeugt
+  - Das Modell endet mit mindestens einem End Event
+  - Sequenzfluss verbindet Aktivitaeten, Gateways und Enden in klarer Reihenfolge
+  - Gateways teilen den Fluss auf oder fuehren ihn zusammen; keine Gateway-Attrappen ohne echte Verzweigung
+  - Aktivitaeten sind immer einer Rolle/Lane zugeordnet
+  - Datenobjekte/Annotationen nur mit klarer Zuordnung zu einem Schritt
   - Gateways nur bei echter Entscheidung und mit mindestens 2 ausgehenden Bedingungen
+  - Exklusives Gateway MUSS genau 2+ ausgehende Bedingungen haben; ein Ein-Zweig-Gateway ist UNGUELTIG
+  - Bei binaerer Entscheidung IMMER zwei Zweige modellieren (z. B. "Ja"/"Nein" oder "OK"/"Fehler")
   - Bedingungen an Gateways klar beschriften (bevorzugt "Ja"/"Nein" bei binären Entscheidungen)
+  - Gateway-Bedingungen duerfen nicht leer sein und nicht mehrfach auf dasselbe Ziel zeigen
+  - Aufeinanderfolgende Aktivitaeten ohne Entscheidung direkt verbinden (kein Pseudo-Gateway)
   - Endereignisse ohne ausgehende Kanten
   - Wenn keine Entscheidung vorliegt, keinen Gateway erzeugen (direkte Task-Folge)
   - Hauptpfad und Nebenpfad klar trennen: Der laengste Entscheidungszweig ist Hauptpfad; Korrektur-/Fehlerzweige sind Nebenpfade
   - Loops explizit modellieren: Rueckfuehrung muss auf den betroffenen Pruefschritt zeigen, nicht auf entfernte Sammelpunkte
   - Nebenpfad-Semantik praezise benennen ("Korrektur", "Nacharbeit", "Fehlerbehandlung"), damit Routing robust unterscheidbar ist
   - Keine konkurrierenden direkten Kanten zum Abschluss, wenn ein Korrektur-Loop vorgesehen ist
+  - Abfolge-Logik strikt einhalten: jeder Schritt braucht einen klaren Vorgaenger/Nachfolger; keine isolierten oder widerspruechlichen Kanten
+  - BPMN-Syntax strikt einhalten: type "gateway" nur mit "conditions", type "task" nur mit "next", type "end" ohne ausgehende Kanten
 - Falls der Eingangstext bereits BPMN-orientiert strukturiert ist (z. B. mit Rollen-, Status-, Abhaengigkeits- oder Zeitachsen-Hinweisen),
   dann diese Informationen direkt auswerten und in Steps, Rollen, Gateway-Bedingungen und Kanten ueberfuehren.
 - Statuswerte wie "offen", "in Bearbeitung", "geprueft", "freigegeben", "abgeschlossen" als fachliche Hinweise behandeln,
@@ -98,6 +111,83 @@ ${learningSection}
 
 TEXT:
 ${text}
+`;
+}
+
+export function buildRepairPrompt({
+    sourceText,
+    previousJson,
+    validationErrors = [],
+    learningGuidance = ""
+}) {
+    const errorLines = (Array.isArray(validationErrors) ? validationErrors : [])
+        .map((item, index) => `- Fehler ${index + 1}: ${String(item || "").trim()}`)
+        .filter(Boolean)
+        .join("\n");
+    const learningSection = learningGuidance ? `\n${learningGuidance}\n` : "";
+
+    return `
+Du bist ein BPMN-JSON-Reparaturassistent.
+
+Repariere das gegebene JSON so, dass es alle BPMN-Regeln einhaelt und gueltig ist.
+
+REGELN:
+- Gib NUR gueltiges JSON zurueck (kein Markdown, kein Erklaertext)
+- Halte die fachliche Bedeutung des Quelltexts stabil
+- Behebe NUR strukturelle/semantische Modellierungsfehler
+- Keine doppelten IDs, keine null-Werte, keine losen Kanten
+
+FORMAT (Root-Objekt):
+{
+  "roles": ["Rolle1", "Rolle2"],
+  "annotations": [
+    { "id": "ann_1", "text": "Kurzer Hinweistext", "attachTo": "step_3" }
+  ],
+  "steps": [
+    {
+      "id": "step_1",
+      "type": "task | gateway | end",
+      "taskKind": "userTask | serviceTask | manualTask | scriptTask | sendTask | receiveTask | businessRuleTask | task",
+      "label": "Kurzbeschreibung",
+      "role": "Rolle",
+      "documentation": "Optionale ausfuehrliche Beschreibung",
+      "next": ["step_2"],
+      "conditions": [
+        { "label": "Ja", "target": "step_3" },
+        { "label": "Nein", "target": "step_4" }
+      ],
+      "boundaryTimers": [
+        {
+          "label": "Timer Kurzname",
+          "target": "step_ziel_nach_timer",
+          "interrupting": true,
+          "duration": "optional z.B. PT24H oder Freitext"
+        }
+      ]
+    }
+  ]
+}
+
+WICHTIG:
+- Der erste Schritt ist type "task"
+- Mindestens 1 End Event (type "end")
+- Gateways nur bei echter Entscheidung und immer mit 2+ Bedingungen
+- "conditions" nur bei gateways, "next" nur bei tasks
+- End Events ohne ausgehende Kanten
+- Jede Rolle pro Step muss in "roles" vorkommen
+- Jede target-Referenz muss auf existierende Step-ID zeigen
+- Hauptpfad klar, Nebenpfade eindeutig beschriftet (z. B. Nein/Fehler/Korrektur)
+- Exakt ein fachlicher Einstiegs-Step (nur ein Schritt ohne eingehende Kante)
+${learningSection}
+
+ZU BEHEBENDE VALIDIERUNGSFEHLER:
+${errorLines || "- (keine Einzelpunkte uebergeben; trotzdem JSON robust reparieren)"}
+
+QUELLTEXT:
+${sourceText}
+
+FEHLERHAFTES JSON:
+${JSON.stringify(previousJson, null, 2)}
 `;
 }
 

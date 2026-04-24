@@ -174,6 +174,7 @@ function App() {
     const activePaletteEntryRef = useRef(null);
     const coloringListenersBoundRef = useRef(false);
     const fileInputRef = useRef(null);
+    const autoRelayoutOnImportRef = useRef(false);
 
     const attachPalette = () => {
         if (!containerRef.current || !paletteHostRef.current) return;
@@ -310,7 +311,15 @@ function App() {
     const applyElementColor = (element) => {
         if (!modelerRef.current || !element) return;
         const modeling = modelerRef.current.get("modeling");
-        const color = getColorByElement(element);
+        let color = getColorByElement(element);
+        if (isBpmnType(element, "bpmn:Gateway")) {
+            const incomingCount = Array.isArray(element?.incoming) ? element.incoming.length : 0;
+            const outgoingCount = Array.isArray(element?.outgoing) ? element.outgoing.length : 0;
+            const isMergeGateway = incomingCount >= 2 && outgoingCount <= 1;
+            if (isMergeGateway) {
+                color = { fill: "#FFFFFF", stroke: "#000000" };
+            }
+        }
         const di = element?.di;
         const currentFill = di?.fill ?? di?.get?.("fill");
         const currentStroke = di?.stroke ?? di?.get?.("stroke");
@@ -419,12 +428,18 @@ function App() {
 
         modeler
             .importXML(xml)
-            .then(() => {
+            .then(async () => {
                 if (cancelled) return;
                 attachPalette();
                 setupPaletteInteraction();
                 applyPaletteGroupLabels();
                 applyElementColors();
+                if (autoRelayoutOnImportRef.current) {
+                    autoRelayoutOnImportRef.current = false;
+                    await relayoutCurrentDiagram().catch((err) => {
+                        console.error("Editor-Relayout Fehler:", err);
+                    });
+                }
                 modeler.get("canvas").zoom("fit-viewport");
             })
             .catch((err) => {
@@ -525,15 +540,16 @@ function App() {
                         setStatus(msg);
                         if (typeof data?.data?.xml === "string" && data.data.xml.trim()) {
                             setXml(String(data.data.xml));
-                            // Ensure progressive imports are visually noticeable.
-                            // This prevents React from collapsing multiple XML updates into one frame.
-                            await new Promise((resolve) => window.setTimeout(resolve, 120));
+                            // Zeitlupenmodus: Zwischenstaende bewusst verzögert anzeigen,
+                            // damit die Modellierungsreihenfolge visuell nachvollziehbar bleibt.
+                            await new Promise((resolve) => window.setTimeout(resolve, 550));
                         }
                         continue;
                     }
                     if (event === "complete") {
                         completed = true;
                         if (data?.success) {
+                            autoRelayoutOnImportRef.current = true;
                             setJson(data.json);
                             setXml(data.xml);
                             setWarning("");
@@ -608,6 +624,7 @@ function App() {
 
         const laneNodes = new Map(laneRows.map(({ lane }) => [lane.id, []]));
         const laneByNodeId = new Map();
+        const nodeById = new Map(nodes.map((node) => [node.id, node]));
         nodes.forEach((node) => {
             const centerY = node.y + node.height / 2;
             const row = laneRows.find(({ y, h }) => centerY >= y && centerY <= y + h);
@@ -615,6 +632,7 @@ function App() {
             laneNodes.get(row.lane.id).push(node);
             laneByNodeId.set(node.id, row.lane);
         });
+
 
         const branchOffsetByTarget = new Map();
         sequenceFlows.forEach((flow) => {
@@ -639,6 +657,7 @@ function App() {
         const targetPosById = new Map();
         const LANE_PADDING = 18;
         const BRANCH_VERTICAL_OFFSET = 120;
+        const GATEWAY_CLUSTER_EXTRA_SPACING = 1.2;
         laneRows.forEach(({ lane, y, h }) => {
             const laneCenterY = y + h / 2;
             const rowNodes = laneNodes.get(lane.id) || [];
@@ -673,6 +692,12 @@ function App() {
                 byRow.get(rowKey).push(node);
             });
 
+            const isGatewayClusterNode = (node) => {
+                if (isBpmnType(node, "bpmn:Gateway")) return true;
+                return sequenceFlows.some((flow) => flow.source?.id === node.id || flow.target?.id === node.id)
+                    && sequenceFlows.some((flow) => isBpmnType(flow.source, "bpmn:Gateway") || isBpmnType(flow.target, "bpmn:Gateway"));
+            };
+
             byRow.forEach((bucketNodes) => {
                 bucketNodes.sort((a, b) => (targetPosById.get(a.id)?.x || a.x) - (targetPosById.get(b.id)?.x || b.x));
                 for (let i = 1; i < bucketNodes.length; i += 1) {
@@ -681,7 +706,11 @@ function App() {
                     const prevPos = targetPosById.get(prev.id);
                     const currPos = targetPosById.get(curr.id);
                     if (!prevPos || !currPos) continue;
-                    const minX = prevPos.x + prev.width + 44;
+                    const touchesGatewayCluster = isGatewayClusterNode(prev) || isGatewayClusterNode(curr);
+                    const minGap = touchesGatewayCluster
+                        ? Math.round(44 * GATEWAY_CLUSTER_EXTRA_SPACING)
+                        : 44;
+                    const minX = prevPos.x + prev.width + minGap;
                     if (currPos.x < minX) {
                         currPos.x = minX;
                     }
@@ -730,6 +759,173 @@ function App() {
                             a.pos.x = Math.max(a.pos.x, b.pos.x + b.node.width + 52);
                             if (a.pos.y > laneMaxYForA) a.pos.y = laneMaxYForA;
                             changed = true;
+                        }
+                    }
+                }
+                if (!changed) break;
+            }
+
+            // Deterministic lane sweep: guarantee no rectangle overlap remains.
+            // Keep element order and push right when necessary.
+            const SWEEP_GAP_X = 48;
+            const sortedByX = lanePlaced
+                .slice()
+                .sort((a, b) => {
+                    if (a.pos.x !== b.pos.x) return a.pos.x - b.pos.x;
+                    return a.pos.y - b.pos.y;
+                });
+            for (let sweepPass = 0; sweepPass < 2; sweepPass += 1) {
+                for (let i = 1; i < sortedByX.length; i += 1) {
+                    const prev = sortedByX[i - 1];
+                    const curr = sortedByX[i];
+                    const prevRect = {
+                        x: prev.pos.x,
+                        y: prev.pos.y,
+                        w: prev.node.width,
+                        h: prev.node.height
+                    };
+                    const currRect = {
+                        x: curr.pos.x,
+                        y: curr.pos.y,
+                        w: curr.node.width,
+                        h: curr.node.height
+                    };
+                    if (overlaps(prevRect, currRect, 12)) {
+                        const requiredX = prev.pos.x + prev.node.width + SWEEP_GAP_X;
+                        if (curr.pos.x < requiredX) {
+                            curr.pos.x = requiredX;
+                        }
+                    }
+                }
+            }
+
+            // Hard gateway de-spacing pass (explicit rule):
+            // keep gateways and their direct neighbors clearly separated.
+            const gatewayNodes = rowNodes
+                .filter((node) => isBpmnType(node, "bpmn:Gateway"))
+                .sort((a, b) => (targetPosById.get(a.id)?.x || a.x) - (targetPosById.get(b.id)?.x || b.x));
+            const GATEWAY_TO_GATEWAY_GAP = 72;
+            const GATEWAY_NEIGHBOR_GAP = 64;
+            const outgoingBySource = new Map();
+            const incomingByTarget = new Map();
+            sequenceFlows.forEach((flow) => {
+                if (flow.source?.id && flow.target?.id) {
+                    const out = outgoingBySource.get(flow.source.id) || [];
+                    out.push(flow.target.id);
+                    outgoingBySource.set(flow.source.id, out);
+                    const inc = incomingByTarget.get(flow.target.id) || [];
+                    inc.push(flow.source.id);
+                    incomingByTarget.set(flow.target.id, inc);
+                }
+            });
+
+            // 1) gateway-to-gateway spacing in lane
+            for (let i = 1; i < gatewayNodes.length; i += 1) {
+                const prev = gatewayNodes[i - 1];
+                const curr = gatewayNodes[i];
+                const prevPos = targetPosById.get(prev.id);
+                const currPos = targetPosById.get(curr.id);
+                if (!prevPos || !currPos) continue;
+                const minX = prevPos.x + prev.width + GATEWAY_TO_GATEWAY_GAP;
+                if (currPos.x < minX) {
+                    currPos.x = minX;
+                }
+            }
+
+            // 2) gateway-neighbor spacing (incoming/outgoing)
+            gatewayNodes.forEach((gateway) => {
+                const gatewayPos = targetPosById.get(gateway.id);
+                if (!gatewayPos) return;
+                const neighbors = new Set([
+                    ...(outgoingBySource.get(gateway.id) || []),
+                    ...(incomingByTarget.get(gateway.id) || [])
+                ]);
+                neighbors.forEach((neighborId) => {
+                    const neighborNode = rowNodes.find((node) => node.id === neighborId);
+                    const neighborPos = targetPosById.get(neighborId);
+                    if (!neighborNode || !neighborPos) return;
+                    if (neighborPos.x >= gatewayPos.x) {
+                        const minNeighborX = gatewayPos.x + gateway.width + GATEWAY_NEIGHBOR_GAP;
+                        if (neighborPos.x < minNeighborX) {
+                            neighborPos.x = minNeighborX;
+                        }
+                    } else {
+                        const maxNeighborX = gatewayPos.x - neighborNode.width - GATEWAY_NEIGHBOR_GAP;
+                        if (neighborPos.x > maxNeighborX) {
+                            neighborPos.x = maxNeighborX;
+                        }
+                    }
+                });
+            });
+
+            // Hard fallback: if a gateway still overlaps any node in lane,
+            // push the other node horizontally away from the gateway.
+            const gatewayOverlapGap = 56;
+            for (let pass = 0; pass < 5; pass += 1) {
+                let fixed = false;
+                gatewayNodes.forEach((gateway) => {
+                    const gPos = targetPosById.get(gateway.id);
+                    if (!gPos) return;
+                    const gRect = { x: gPos.x, y: gPos.y, w: gateway.width, h: gateway.height };
+                    rowNodes.forEach((node) => {
+                        if (!node || node.id === gateway.id) return;
+                        const nPos = targetPosById.get(node.id);
+                        if (!nPos) return;
+                        const nRect = { x: nPos.x, y: nPos.y, w: node.width, h: node.height };
+                        if (!overlaps(gRect, nRect, 10)) return;
+
+                        const nodeCenterX = nPos.x + node.width / 2;
+                        const gatewayCenterX = gPos.x + gateway.width / 2;
+                        if (nodeCenterX >= gatewayCenterX) {
+                            const minX = gPos.x + gateway.width + gatewayOverlapGap;
+                            if (nPos.x < minX) {
+                                nPos.x = minX;
+                                fixed = true;
+                            }
+                        } else {
+                            const maxX = gPos.x - node.width - gatewayOverlapGap;
+                            if (nPos.x > maxX) {
+                                nPos.x = maxX;
+                                fixed = true;
+                            }
+                        }
+                    });
+                });
+                if (!fixed) break;
+            }
+        });
+
+        // Absolute final no-overlap pass per lane: if anything still overlaps,
+        // push the right-side node to the right with fixed spacing.
+        const FINAL_NO_OVERLAP_GAP_X = 52;
+        laneRows.forEach(({ lane }) => {
+            const laneId = lane.id;
+            const placed = (laneNodes.get(laneId) || [])
+                .map((node) => ({ node, pos: targetPosById.get(node.id) }))
+                .filter(({ pos }) => Boolean(pos));
+            for (let pass = 0; pass < 8; pass += 1) {
+                let changed = false;
+                for (let i = 0; i < placed.length; i += 1) {
+                    for (let j = i + 1; j < placed.length; j += 1) {
+                        const a = placed[i];
+                        const b = placed[j];
+                        const aRect = { x: a.pos.x, y: a.pos.y, w: a.node.width, h: a.node.height };
+                        const bRect = { x: b.pos.x, y: b.pos.y, w: b.node.width, h: b.node.height };
+                        if (!overlaps(aRect, bRect, 8)) continue;
+                        const aCenterX = a.pos.x + a.node.width / 2;
+                        const bCenterX = b.pos.x + b.node.width / 2;
+                        if (bCenterX >= aCenterX) {
+                            const minX = a.pos.x + a.node.width + FINAL_NO_OVERLAP_GAP_X;
+                            if (b.pos.x < minX) {
+                                b.pos.x = minX;
+                                changed = true;
+                            }
+                        } else {
+                            const minX = b.pos.x + b.node.width + FINAL_NO_OVERLAP_GAP_X;
+                            if (a.pos.x < minX) {
+                                a.pos.x = minX;
+                                changed = true;
+                            }
                         }
                     }
                 }
